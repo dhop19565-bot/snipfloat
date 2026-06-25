@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pillow pystray pywin32 pyinstaller
+          pip install pillow pystray pywin32 pyinstaller numpy
 
       - name: Build EXE
         run: |
