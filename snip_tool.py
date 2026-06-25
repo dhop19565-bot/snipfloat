@@ -11,6 +11,16 @@ from PIL import Image, ImageTk, ImageDraw, ImageGrab
 import pystray
 from pystray import MenuItem as item
 
+# Tell Windows this process is DPI-aware so coordinates match pixels exactly
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 # ── Globals ───────────────────────────────────────────────────────────────
 snip_windows = []
 tray_icon    = None
@@ -65,10 +75,6 @@ def make_ico_file():
 
 # ══════════════════════════════════════════════════════════════════════════
 #  SELECTION OVERLAY
-#  Strategy: take a full-screen screenshot FIRST, display it as the
-#  overlay background so the user sees their screen, then draw the
-#  selection box on top. This means the overlay can be fully opaque
-#  (so clicks always register) while looking like the screen is visible.
 # ══════════════════════════════════════════════════════════════════════════
 class SelectionOverlay:
     def __init__(self):
@@ -78,30 +84,43 @@ class SelectionOverlay:
         self.dash_off = 0
         self.anim_id  = None
 
-        # 1. Grab the screen BEFORE showing any window
-        self.screen_img = ImageGrab.grab()
-        sw, sh = self.screen_img.size
+        # Get screen size in logical pixels
+        tmp = tk.Toplevel(_tk_root)
+        tk_sw = tmp.winfo_screenwidth()
+        tk_sh = tmp.winfo_screenheight()
+        tmp.destroy()
 
-        # 2. Build fullscreen window
+        # Work out DPI scale factor
+        try:
+            import ctypes
+            dc = ctypes.windll.user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88)  # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(0, dc)
+            self.scale_x = dpi / 96.0
+            self.scale_y = dpi / 96.0
+        except Exception:
+            self.scale_x = 1.0
+            self.scale_y = 1.0
+
+        self.tk_sw = tk_sw
+        self.tk_sh = tk_sh
+
         self.win = tk.Toplevel(_tk_root)
         self.win.withdraw()
         self.win.overrideredirect(True)
-        self.win.geometry(f"{sw}x{sh}+0+0")
+        self.win.geometry(f"{tk_sw}x{tk_sh}+0+0")
         self.win.attributes("-topmost", True)
+        self.win.attributes("-alpha", 0.15)   # light grey wash — clicks register fine
         self.win.configure(bg="black")
         self.win.config(cursor="crosshair")
 
-        # 3. Canvas with screenshot as background
-        self.cv = tk.Canvas(self.win, width=sw, height=sh,
+        self.cv = tk.Canvas(self.win, width=tk_sw, height=tk_sh,
                             bd=0, highlightthickness=0, bg="black")
         self.cv.pack(fill=tk.BOTH, expand=True)
 
-        self.bg_photo = ImageTk.PhotoImage(self.screen_img)
-        self.cv.create_image(0, 0, anchor=tk.NW, image=self.bg_photo)
-
-        # 4. Crosshair lines
-        self.hline = self.cv.create_line(0,0,sw,0, fill=BLUE, width=1, dash=(5,4))
-        self.vline = self.cv.create_line(0,0,0,sh, fill=BLUE, width=1, dash=(5,4))
+        # Crosshair
+        self.hline = self.cv.create_line(0,0,tk_sw,0, fill=BLUE, width=1, dash=(5,4))
+        self.vline = self.cv.create_line(0,0,0,tk_sh, fill=BLUE, width=1, dash=(5,4))
 
         self.sel_fill  = None
         self.sel_outer = None
@@ -120,9 +139,8 @@ class SelectionOverlay:
 
     def _move(self, e):
         if not self.dragging:
-            sw,sh = self.screen_img.size
-            self.cv.coords(self.hline, 0,e.y, sw,e.y)
-            self.cv.coords(self.vline, e.x,0, e.x,sh)
+            self.cv.coords(self.hline, 0, e.y, self.tk_sw, e.y)
+            self.cv.coords(self.vline, e.x, 0, e.x, self.tk_sh)
 
     def _press(self, e):
         self.start_x = self.cur_x = e.x
@@ -151,13 +169,12 @@ class SelectionOverlay:
         self.cv.coords(self.sel_fill,  x1,y1,x2,y2)
         self.cv.coords(self.sel_outer, x1,y1,x2,y2)
         self.cv.coords(self.sel_inner, x1,y1,x2,y2)
-        w,h = abs(x2-x1),abs(y2-y1)
-        sw,sh = self.screen_img.size
+        w,h = abs(x2-x1), abs(y2-y1)
         lx,ly = max(x1,x2)+4, max(y1,y2)+4
         anch = "nw"
-        if lx+90>sw: lx=min(x1,x2)-4; anch="ne"
-        if ly+22>sh: ly=min(y1,y2)-4
-        self.cv.coords(self.sel_label, lx,ly)
+        if lx+90 > self.tk_sw: lx = min(x1,x2)-4; anch="ne"
+        if ly+22 > self.tk_sh: ly = min(y1,y2)-4
+        self.cv.coords(self.sel_label, lx, ly)
         self.cv.itemconfigure(self.sel_label, text=f" {w} × {h} ", anchor=anch)
 
     def _animate(self):
@@ -169,13 +186,20 @@ class SelectionOverlay:
     def _release(self, e):
         self.dragging = False
         if self.anim_id: self.win.after_cancel(self.anim_id)
-        x1 = min(self.start_x,e.x);  y1 = min(self.start_y,e.y)
-        x2 = max(self.start_x,e.x);  y2 = max(self.start_y,e.y)
+
+        # Convert tkinter coords → real pixel coords for the crop
+        x1 = int(min(self.start_x, e.x) * self.scale_x)
+        y1 = int(min(self.start_y, e.y) * self.scale_y)
+        x2 = int(max(self.start_x, e.x) * self.scale_x)
+        y2 = int(max(self.start_y, e.y) * self.scale_y)
+
         self.win.destroy()
-        if (x2-x1)>5 and (y2-y1)>5:
-            # Crop from the screenshot we already took — no need to grab again
-            cropped = self.screen_img.crop((x1,y1,x2,y2))
-            _tk_root.after(0, lambda: FloatingSnip(cropped, x=max(0,x1), y=max(0,y1-30)))
+
+        if (x2-x1) > 5 and (y2-y1) > 5:
+            sx = max(0, int(min(self.start_x, e.x)))
+            sy = max(0, int(min(self.start_y, e.y)) - 30)
+            # Destroy overlay first, wait for it to vanish, then grab
+            _tk_root.after(200, lambda: _do_grab(x1, y1, x2, y2, sx, sy))
 
     def _cancel(self):
         self.dragging = False
@@ -201,7 +225,6 @@ class FloatingSnip:
 
         self.win.geometry(f"{w}x{h+30}+{x}+{y}")
 
-        # title bar
         bar = tk.Frame(self.win, bg=DARK_BG, height=30)
         bar.pack(fill=tk.X, side=tk.TOP)
         bar.pack_propagate(False)
@@ -215,14 +238,12 @@ class FloatingSnip:
                       activebackground=fg, activeforeground="white",
                       command=cmd).pack(side=tk.RIGHT)
 
-        # image
         self.tk_img = ImageTk.PhotoImage(image)
         cv = tk.Canvas(self.win, width=w, height=h,
                        bd=0, highlightthickness=0, bg=DARK_BG, cursor="fleur")
         cv.pack(fill=tk.BOTH, expand=True)
         cv.create_image(0,0, anchor=tk.NW, image=self.tk_img)
 
-        # drag anywhere to move
         self._dx = self._dy = 0
         for widget in [bar, cv] + list(bar.winfo_children()):
             widget.bind("<ButtonPress-1>", self._ds)
@@ -268,6 +289,11 @@ class FloatingSnip:
 # ══════════════════════════════════════════════════════════════════════════
 def take_snip():
     _tk_root.after(0, SelectionOverlay)
+
+def _do_grab(x1, y1, x2, y2, sx, sy):
+    # x1/y1/x2/y2 are already in real pixel coords (scaled)
+    img = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+    FloatingSnip(img, x=sx, y=sy)
 
 def close_all_snips():
     for w in list(snip_windows): w.close()
