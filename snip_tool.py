@@ -97,15 +97,6 @@ def _open_overlay():
 
     vl, vt, vw, vh = get_virtual_desktop()
 
-    # Take screenshot before any window appears
-    try:
-        screenshot = ImageGrab.grab(
-            bbox=(vl, vt, vl+vw, vt+vh), all_screens=True)
-    except Exception:
-        screenshot = ImageGrab.grab()
-        vw, vh = screenshot.size
-        vl, vt = 0, 0
-
     state = {
         "dragging": False,
         "start_x": 0, "start_y": 0,
@@ -121,21 +112,13 @@ def _open_overlay():
     win.overrideredirect(True)
     win.geometry(f"{vw}x{vh}+{vl}+{vt}")
     win.attributes("-topmost", True)
-    win.configure(bg="black")
+    win.attributes("-alpha", 0.30)   # light enough to see through, solid enough for clicks
+    win.configure(bg="#202020")
     win.config(cursor="crosshair")
 
     cv = tk.Canvas(win, width=vw, height=vh,
-                   bd=0, highlightthickness=0, bg="black")
+                   bd=0, highlightthickness=0, bg="#202020")
     cv.pack(fill=tk.BOTH, expand=True)
-
-    # Screenshot as background
-    bg_photo = ImageTk.PhotoImage(screenshot)
-    cv.create_image(0, 0, anchor=tk.NW, image=bg_photo)
-    # Store reference to prevent GC
-    win._bg_photo = bg_photo
-
-    # Dim overlay on top
-    cv.create_rectangle(0, 0, vw, vh, fill="black", stipple="gray25", outline="")
 
     # Crosshair
     state["hline"] = cv.create_line(0,0,vw,0, fill=BLUE, width=1, dash=(6,4))
@@ -197,13 +180,27 @@ def _open_overlay():
 
     def _finish(rx1, ry1, rx2, ry2):
         global _snip_active
+        valid = (rx2-rx1) > 5 and (ry2-ry1) > 5
+        # Real screen coords of the selection
+        real_x1 = vl + rx1
+        real_y1 = vt + ry1
+        real_x2 = vl + rx2
+        real_y2 = vt + ry2
+        # Hide overlay instantly so it's not in the grab
         win.destroy()
         _snip_active = False
-        if (rx2-rx1) > 5 and (ry2-ry1) > 5:
-            cropped = screenshot.crop((rx1, ry1, rx2, ry2))
-            sx = vl + rx1
-            sy = vt + ry1
-            FloatingSnip(cropped, x=sx, y=sy)
+        if valid:
+            # Grab ONLY the selected region — fast even on multi-monitor
+            def grab_and_show():
+                try:
+                    img = ImageGrab.grab(
+                        bbox=(real_x1, real_y1, real_x2, real_y2),
+                        all_screens=True)
+                    FloatingSnip(img, x=real_x1, y=real_y1)
+                except Exception:
+                    pass
+            # Tiny delay lets the overlay fully clear from screen first
+            _tk_root.after(30, grab_and_show)
 
     cv.bind("<Motion>",          on_move)
     cv.bind("<ButtonPress-1>",   on_press)
