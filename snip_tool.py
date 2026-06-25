@@ -170,8 +170,13 @@ def _open_overlay():
     def on_release(e):
         state["dragging"] = False
         if state["anim_id"]: win.after_cancel(state["anim_id"])
-        rx1 = min(state["start_x"], e.x);  ry1 = min(state["start_y"], e.y)
-        rx2 = max(state["start_x"], e.x);  ry2 = max(state["start_y"], e.y)
+        # Clamp coordinates to the canvas bounds (0..vw, 0..vh)
+        ex = max(0, min(e.x, vw))
+        ey = max(0, min(e.y, vh))
+        sx = max(0, min(state["start_x"], vw))
+        sy = max(0, min(state["start_y"], vh))
+        rx1 = min(sx, ex);  ry1 = min(sy, ey)
+        rx2 = max(sx, ex);  ry2 = max(sy, ey)
         _finish(rx1, ry1, rx2, ry2)
 
     def on_escape(e):
