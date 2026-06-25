@@ -22,11 +22,11 @@ except Exception:
         pass
 
 # ── Globals ───────────────────────────────────────────────────────────────
-snip_windows     = []
-tray_icon        = None
-_tk_root         = None
-_tk_ready        = threading.Event()
-_overlay_lock    = threading.Lock()
+snip_windows  = []
+tray_icon     = None
+_tk_root      = None
+_tk_ready     = threading.Event()
+_snip_active  = False
 
 ORANGE    = "#FF8C00"
 ORANGE_DK = "#CC6600"
@@ -75,171 +75,145 @@ def make_ico_file():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  VIRTUAL DESKTOP SIZE  (all monitors, real pixels)
+#  VIRTUAL DESKTOP
 # ══════════════════════════════════════════════════════════════════════════
 def get_virtual_desktop():
     u = ctypes.windll.user32
-    l = u.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
-    t = u.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
-    w = u.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
-    h = u.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+    l = u.GetSystemMetrics(76)
+    t = u.GetSystemMetrics(77)
+    w = u.GetSystemMetrics(78)
+    h = u.GetSystemMetrics(79)
     return l, t, w, h
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  SELECTION OVERLAY  — tkinter, but using the screenshot as background
-#  so the window is fully opaque (clicks always work) yet looks transparent
+#  SELECTION OVERLAY  — runs on the MAIN Tk thread via _tk_root.after()
 # ══════════════════════════════════════════════════════════════════════════
-class SelectionOverlay:
-    def __init__(self):
-        self.start_x  = self.start_y = 0
-        self.cur_x    = self.cur_y   = 0
-        self.dragging = False
-        self.dash_off = 0
-        self.anim_id  = None
+def _open_overlay():
+    global _snip_active
+    if _snip_active:
+        return
+    _snip_active = True
 
-        # --- 1. Grab the full virtual desktop BEFORE showing any window ---
-        vl, vt, vw, vh = get_virtual_desktop()
-        self.vl, self.vt = vl, vt
-        self.vw, self.vh = vw, vh
+    vl, vt, vw, vh = get_virtual_desktop()
 
-        try:
-            self.screenshot = ImageGrab.grab(
-                bbox=(vl, vt, vl+vw, vt+vh), all_screens=True)
-        except Exception:
-            self.screenshot = ImageGrab.grab()
-            vw, vh = self.screenshot.size
-            self.vw, self.vh = vw, vh
+    # Take screenshot before any window appears
+    try:
+        screenshot = ImageGrab.grab(
+            bbox=(vl, vt, vl+vw, vt+vh), all_screens=True)
+    except Exception:
+        screenshot = ImageGrab.grab()
+        vw, vh = screenshot.size
+        vl, vt = 0, 0
 
-        # --- 2. Build a SEPARATE Tk root for the overlay ---
-        #        (avoids any shared state with _tk_root)
-        self.root = tk.Tk()
-        self.root.withdraw()
-        self.root.overrideredirect(True)
+    state = {
+        "dragging": False,
+        "start_x": 0, "start_y": 0,
+        "cur_x": 0,   "cur_y": 0,
+        "dash_off": 0,
+        "anim_id": None,
+        "hline": None, "vline": None,
+        "sel_outer": None, "sel_inner": None, "sel_label": None,
+    }
 
-        # Place at virtual desktop origin, size = full virtual desktop
-        self.root.geometry(f"{vw}x{vh}+{vl}+{vt}")
-        self.root.attributes("-topmost", True)
-        self.root.config(cursor="crosshair")
-        self.root.configure(bg="black")
+    win = tk.Toplevel(_tk_root)
+    win.withdraw()
+    win.overrideredirect(True)
+    win.geometry(f"{vw}x{vh}+{vl}+{vt}")
+    win.attributes("-topmost", True)
+    win.configure(bg="black")
+    win.config(cursor="crosshair")
 
-        # --- 3. Canvas with screenshot as background ---
-        self.cv = tk.Canvas(self.root, width=vw, height=vh,
-                            bd=0, highlightthickness=0, bg="black")
-        self.cv.pack(fill=tk.BOTH, expand=True)
+    cv = tk.Canvas(win, width=vw, height=vh,
+                   bd=0, highlightthickness=0, bg="black")
+    cv.pack(fill=tk.BOTH, expand=True)
 
-        # Background: screenshot
-        self.bg_photo = ImageTk.PhotoImage(self.screenshot)
-        self.cv.create_image(0, 0, anchor=tk.NW, image=self.bg_photo)
+    # Screenshot as background
+    bg_photo = ImageTk.PhotoImage(screenshot)
+    cv.create_image(0, 0, anchor=tk.NW, image=bg_photo)
+    # Store reference to prevent GC
+    win._bg_photo = bg_photo
 
-        # Dark overlay on top of screenshot
-        self.cv.create_rectangle(0, 0, vw, vh,
-                                 fill="black", stipple="gray25", outline="")
+    # Dim overlay on top
+    cv.create_rectangle(0, 0, vw, vh, fill="black", stipple="gray25", outline="")
 
-        # Crosshair lines
-        self.hline = self.cv.create_line(0,0, vw,0,
-                                          fill=BLUE, width=1, dash=(6,4))
-        self.vline = self.cv.create_line(0,0, 0,vh,
-                                          fill=BLUE, width=1, dash=(6,4))
+    # Crosshair
+    state["hline"] = cv.create_line(0,0,vw,0, fill=BLUE, width=1, dash=(6,4))
+    state["vline"] = cv.create_line(0,0,0,vh, fill=BLUE, width=1, dash=(6,4))
 
-        self.sel_clear = None   # rectangle to reveal unshaded screenshot
-        self.sel_outer = None
-        self.sel_inner = None
-        self.sel_label = None
+    def on_move(e):
+        if not state["dragging"]:
+            cv.coords(state["hline"], 0, e.y, vw, e.y)
+            cv.coords(state["vline"], e.x, 0, e.x, vh)
 
-        self.cv.bind("<Motion>",          self._move)
-        self.cv.bind("<ButtonPress-1>",   self._press)
-        self.cv.bind("<B1-Motion>",       self._drag)
-        self.cv.bind("<ButtonRelease-1>", self._release)
-        self.root.bind("<Escape>",        lambda e: self._cancel())
+    def on_press(e):
+        state["dragging"]  = True
+        state["start_x"]   = state["cur_x"] = e.x
+        state["start_y"]   = state["cur_y"] = e.y
+        cv.itemconfigure(state["hline"], state="hidden")
+        cv.itemconfigure(state["vline"], state="hidden")
+        state["sel_outer"] = cv.create_rectangle(e.x,e.y,e.x,e.y,
+                                 outline="white", width=1)
+        state["sel_inner"] = cv.create_rectangle(e.x,e.y,e.x,e.y,
+                                 outline=BLUE, width=2, dash=(6,4))
+        state["sel_label"] = cv.create_text(e.x+4,e.y+4, text="",
+                                 fill="white", font=("Segoe UI",9,"bold"),
+                                 anchor="nw")
+        animate()
 
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
-        self.root.mainloop()   # blocks until destroyed
-
-    # ── crosshair ──────────────────────────────────────────────────────
-    def _move(self, e):
-        if not self.dragging:
-            self.cv.coords(self.hline, 0, e.y, self.vw, e.y)
-            self.cv.coords(self.vline, e.x, 0, e.x, self.vh)
-
-    # ── start drag ─────────────────────────────────────────────────────
-    def _press(self, e):
-        self.start_x = self.cur_x = e.x
-        self.start_y = self.cur_y = e.y
-        self.dragging = True
-
-        self.cv.itemconfigure(self.hline, state="hidden")
-        self.cv.itemconfigure(self.vline, state="hidden")
-
-        # Reveal screenshot inside selection by re-drawing the bg image
-        # clipped to the selection rect — simplest: just remove the dim there
-        self.sel_clear = self.cv.create_image(
-            e.x, e.y, anchor=tk.NW, image=self.bg_photo)   # placeholder
-        self.sel_outer = self.cv.create_rectangle(
-            e.x,e.y,e.x,e.y, outline="white", width=1)
-        self.sel_inner = self.cv.create_rectangle(
-            e.x,e.y,e.x,e.y, outline=BLUE, width=2, dash=(6,4))
-        self.sel_label = self.cv.create_text(
-            e.x+4, e.y+4, text="", fill="white",
-            font=("Segoe UI",9,"bold"), anchor="nw")
-
-        self._animate()
-
-    # ── drag ───────────────────────────────────────────────────────────
-    def _drag(self, e):
-        self.cur_x, self.cur_y = e.x, e.y
-        self._update()
-
-    def _update(self):
-        x1,y1 = self.start_x, self.start_y
-        x2,y2 = self.cur_x,   self.cur_y
+    def on_drag(e):
+        state["cur_x"], state["cur_y"] = e.x, e.y
+        x1,y1 = state["start_x"], state["start_y"]
+        x2,y2 = e.x, e.y
         rx1,ry1 = min(x1,x2), min(y1,y2)
         rx2,ry2 = max(x1,x2), max(y1,y2)
-
-        # Move the clear-image to top-left of selection
-        self.cv.coords(self.sel_clear, rx1, ry1)
-        self.cv.coords(self.sel_outer, rx1,ry1,rx2,ry2)
-        self.cv.coords(self.sel_inner, rx1,ry1,rx2,ry2)
-
+        cv.coords(state["sel_outer"], rx1,ry1,rx2,ry2)
+        cv.coords(state["sel_inner"], rx1,ry1,rx2,ry2)
         w,h = rx2-rx1, ry2-ry1
         lx,ly = rx2+6, ry2+6
         anch = "nw"
-        if lx+110 > self.vw: lx = rx1-6; anch="ne"
-        if ly+22  > self.vh: ly = ry1-6
-        self.cv.coords(self.sel_label, lx, ly)
-        self.cv.itemconfigure(self.sel_label,
-                              text=f" {w} × {h} px ", anchor=anch)
+        if lx+110 > vw: lx=rx1-6; anch="ne"
+        if ly+22  > vh: ly=ry1-6
+        cv.coords(state["sel_label"], lx, ly)
+        cv.itemconfigure(state["sel_label"],
+                         text=f" {w} × {h} px ", anchor=anch)
 
-    # ── marching ants ──────────────────────────────────────────────────
-    def _animate(self):
-        if not self.dragging: return
-        self.dash_off = (self.dash_off+1) % 10
-        self.cv.itemconfigure(self.sel_inner, dashoffset=self.dash_off)
-        self.anim_id = self.root.after(60, self._animate)
+    def animate():
+        if not state["dragging"]: return
+        state["dash_off"] = (state["dash_off"]+1) % 10
+        cv.itemconfigure(state["sel_inner"], dashoffset=state["dash_off"])
+        state["anim_id"] = win.after(60, animate)
 
-    # ── release → crop & show ──────────────────────────────────────────
-    def _release(self, e):
-        self.dragging = False
-        if self.anim_id: self.root.after_cancel(self.anim_id)
+    def on_release(e):
+        state["dragging"] = False
+        if state["anim_id"]: win.after_cancel(state["anim_id"])
+        rx1 = min(state["start_x"], e.x);  ry1 = min(state["start_y"], e.y)
+        rx2 = max(state["start_x"], e.x);  ry2 = max(state["start_y"], e.y)
+        _finish(rx1, ry1, rx2, ry2)
 
-        rx1 = min(self.start_x, e.x);  ry1 = min(self.start_y, e.y)
-        rx2 = max(self.start_x, e.x);  ry2 = max(self.start_y, e.y)
+    def on_escape(e):
+        if state["anim_id"]: win.after_cancel(state["anim_id"])
+        _finish(0, 0, 0, 0)
 
-        self.root.destroy()
-
+    def _finish(rx1, ry1, rx2, ry2):
+        global _snip_active
+        win.destroy()
+        _snip_active = False
         if (rx2-rx1) > 5 and (ry2-ry1) > 5:
-            cropped = self.screenshot.crop((rx1, ry1, rx2, ry2))
-            # Screen position = virtual desktop origin + canvas offset
-            sx = self.vl + rx1
-            sy = self.vt + ry1
-            _tk_root.after(0, lambda: FloatingSnip(cropped, x=sx, y=sy))
+            cropped = screenshot.crop((rx1, ry1, rx2, ry2))
+            sx = vl + rx1
+            sy = vt + ry1
+            FloatingSnip(cropped, x=sx, y=sy)
 
-    def _cancel(self):
-        self.dragging = False
-        if self.anim_id: self.root.after_cancel(self.anim_id)
-        self.root.destroy()
+    cv.bind("<Motion>",          on_move)
+    cv.bind("<ButtonPress-1>",   on_press)
+    cv.bind("<B1-Motion>",       on_drag)
+    cv.bind("<ButtonRelease-1>", on_release)
+    win.bind("<Escape>",         on_escape)
+
+    win.deiconify()
+    win.lift()
+    win.focus_force()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -332,17 +306,10 @@ class FloatingSnip:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  TAKE SNIP  — runs overlay in its own thread with its own Tk instance
+#  TAKE SNIP  — schedules onto main Tk thread
 # ══════════════════════════════════════════════════════════════════════════
 def take_snip():
-    if not _overlay_lock.acquire(blocking=False):
-        return   # already open
-    def _run():
-        try:
-            SelectionOverlay()   # blocks until closed
-        finally:
-            _overlay_lock.release()
-    threading.Thread(target=_run, daemon=True).start()
+    _tk_root.after(0, _open_overlay)
 
 def close_all_snips():
     for w in list(snip_windows): w.close()
