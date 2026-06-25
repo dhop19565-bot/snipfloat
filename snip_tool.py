@@ -76,14 +76,25 @@ def make_ico_file():
 #  DPI SCALE
 # ══════════════════════════════════════════════════════════════════════════
 def get_dpi_scale():
+    """Compare tkinter logical screen size to actual pixel size to get scale."""
     try:
+        # Use a temporary root to get logical screen dimensions
+        test = tk.Toplevel(_tk_root)
+        logical_w = test.winfo_screenwidth()
+        logical_h = test.winfo_screenheight()
+        test.destroy()
+        # Grab a tiny 1x1 screenshot to see real pixel space
+        # Instead, use ctypes to get true resolution
         import ctypes
-        dc  = ctypes.windll.user32.GetDC(0)
-        dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88)
-        ctypes.windll.user32.ReleaseDC(0, dc)
-        return dpi / 96.0
+        user32 = ctypes.windll.user32
+        # SM_CXVIRTUALSCREEN / SM_CYVIRTUALSCREEN = full virtual desktop in real pixels
+        real_w = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        real_h = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        if real_w > 0 and logical_w > 0:
+            return real_w / logical_w, real_h / logical_h
     except Exception:
-        return 1.0
+        pass
+    return 1.0, 1.0
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -96,7 +107,7 @@ class SelectionOverlay:
         self.dragging = False
         self.dash_off = 0
         self.anim_id  = None
-        self.scale    = get_dpi_scale()
+        self.scale_x, self.scale_y = get_dpi_scale()
 
         tmp = tk.Toplevel(_tk_root)
         self.tk_sw = tmp.winfo_screenwidth()
@@ -190,9 +201,8 @@ class SelectionOverlay:
         ly2 = int(max(self.start_y, e.y))
 
         # real pixel coords for ImageGrab
-        sc = self.scale
-        rx1 = int(lx1 * sc);  ry1 = int(ly1 * sc)
-        rx2 = int(lx2 * sc);  ry2 = int(ly2 * sc)
+        rx1 = int(lx1 * self.scale_x);  ry1 = int(ly1 * self.scale_y)
+        rx2 = int(lx2 * self.scale_x);  ry2 = int(ly2 * self.scale_y)
 
         # position for the floating snip window (logical coords)
         sx = max(0, lx1)
@@ -214,9 +224,22 @@ class SelectionOverlay:
 # ══════════════════════════════════════════════════════════════════════════
 def _do_grab(rx1, ry1, rx2, ry2, sx, sy):
     try:
-        img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2), all_screens=True)
+        # Try without all_screens first (correct origin for single monitor)
+        img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2))
         if img and img.size[0] > 0 and img.size[1] > 0:
+            # Sanity check: if image is mostly black, retry with all_screens
+            import numpy as np
+            arr = np.array(img.convert("L"))
+            if arr.mean() < 5:
+                img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2), all_screens=True)
             FloatingSnip(img, x=sx, y=sy)
+    except ImportError:
+        # numpy not available, just grab normally
+        try:
+            img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2))
+            FloatingSnip(img, x=sx, y=sy)
+        except Exception as ex:
+            print(f"Grab error: {ex}")
     except Exception as ex:
         print(f"Grab error: {ex}")
 
