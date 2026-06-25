@@ -57,7 +57,7 @@ def make_tray_image():
     return img
 
 def make_ico_file():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),"snipfloat.ico")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),"darcysniptool.ico")
     sizes,frames = [256,64,48,32,16],[]
     for sz in sizes:
         f = Image.new("RGBA",(sz,sz),(0,0,0,0))
@@ -285,6 +285,7 @@ class FloatingSnip:
         for widget in [self.cv]:
             widget.bind("<ButtonPress-1>",   self._ds)
             widget.bind("<B1-Motion>",       self._dm)
+            widget.bind("<ButtonRelease-1>", self._click_dismiss)
             widget.bind("<ButtonPress-3>",   self._show_menu)
 
         self.win.lift()
@@ -294,9 +295,17 @@ class FloatingSnip:
     def _ds(self, e):
         self._dx = e.x_root - self.win.winfo_x()
         self._dy = e.y_root - self.win.winfo_y()
+        self._moved = False
 
     def _dm(self, e):
+        self._moved = True
         self.win.geometry(f"+{e.x_root-self._dx}+{e.y_root-self._dy}")
+
+    def _click_dismiss(self, e):
+        # Only dismiss if it was a clean click (not a drag)
+        if not self._moved:
+            self.close()
+        self._moved = False
 
     def _show_menu(self, e):
         try:
@@ -365,8 +374,8 @@ def build_tray():
         pystray.Menu.SEPARATOR,
         item("✕  Quit",            quit_app),
     )
-    tray_icon = pystray.Icon("SnipFloat", make_tray_image(),
-                              "SnipFloat — click to snip", menu)
+    tray_icon = pystray.Icon("DarcySnipTool", make_tray_image(),
+                              "DarcySnipTool — click to snip", menu)
     tray_icon.run()
 
 if __name__ == "__main__":
