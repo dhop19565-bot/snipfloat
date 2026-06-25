@@ -260,21 +260,7 @@ class FloatingSnip:
             image.thumbnail((900,700), Image.LANCZOS)
             w,h = image.size
 
-        self.win.geometry(f"{w}x{h+30}+{x}+{y}")
-
-        # ── title bar ─────────────────────────────────────────────────
-        bar = tk.Frame(self.win, bg=DARK_BG, height=30)
-        bar.pack(fill=tk.X, side=tk.TOP)
-        bar.pack_propagate(False)
-        tk.Label(bar, text="  ✂  snip", bg=DARK_BG, fg="#a9b1d6",
-                 font=("Segoe UI",9)).pack(side=tk.LEFT)
-        for txt,fg,cmd in [("✕","#f7768e",self.close),
-                            ("💾","#9ece6a",self.save),
-                            ("📋",BLUE,    self.copy)]:
-            tk.Button(bar, text=txt, bg=DARK_BG, fg=fg,
-                      font=("Segoe UI",9,"bold"), bd=0, padx=8,
-                      activebackground=fg, activeforeground="white",
-                      command=cmd).pack(side=tk.RIGHT)
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
 
         # ── image ─────────────────────────────────────────────────────
         self.tk_img = ImageTk.PhotoImage(image)
@@ -296,7 +282,7 @@ class FloatingSnip:
 
         # ── drag + right-click bindings ────────────────────────────────
         self._dx = self._dy = 0
-        for widget in [bar, self.cv] + list(bar.winfo_children()):
+        for widget in [self.cv]:
             widget.bind("<ButtonPress-1>",   self._ds)
             widget.bind("<B1-Motion>",       self._dm)
             widget.bind("<ButtonPress-3>",   self._show_menu)
@@ -348,6 +334,14 @@ class FloatingSnip:
 def take_snip():
     _tk_root.after(0, SelectionOverlay)
 
+def _start_hotkey_listener():
+    try:
+        import keyboard
+        keyboard.add_hotkey("ctrl+shift+s", take_snip)
+        keyboard.wait()   # blocks this thread forever, listening for hotkeys
+    except ImportError:
+        pass  # keyboard package not available — hotkey simply won't work
+
 def close_all_snips():
     for w in list(snip_windows): w.close()
 
@@ -379,4 +373,6 @@ if __name__ == "__main__":
     make_ico_file()
     threading.Thread(target=_run_tk, daemon=True).start()
     _tk_ready.wait()
+    # Start global hotkey listener (Ctrl+Shift+S) in background thread
+    threading.Thread(target=_start_hotkey_listener, daemon=True).start()
     build_tray()
