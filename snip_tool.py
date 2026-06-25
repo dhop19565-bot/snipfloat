@@ -73,28 +73,37 @@ def make_ico_file():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  DPI SCALE
+#  SCREEN GEOMETRY  (multi-monitor + DPI aware)
 # ══════════════════════════════════════════════════════════════════════════
-def get_dpi_scale():
-    """Compare tkinter logical screen size to actual pixel size to get scale."""
+def get_screen_info():
+    """
+    Returns (scale_x, scale_y, origin_x, origin_y).
+    origin_x/y is the top-left of the virtual desktop in real pixels
+    (negative when a monitor is to the left/above the primary).
+    scale_x/y converts tkinter logical pixels to real pixels.
+    """
     try:
-        # Use a temporary root to get logical screen dimensions
-        test = tk.Toplevel(_tk_root)
-        logical_w = test.winfo_screenwidth()
-        logical_h = test.winfo_screenheight()
-        test.destroy()
-        # Grab a tiny 1x1 screenshot to see real pixel space
-        # Instead, use ctypes to get true resolution
         import ctypes
         user32 = ctypes.windll.user32
-        # SM_CXVIRTUALSCREEN / SM_CYVIRTUALSCREEN = full virtual desktop in real pixels
-        real_w = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
-        real_h = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
-        if real_w > 0 and logical_w > 0:
-            return real_w / logical_w, real_h / logical_h
+
+        # Virtual desktop in real pixels
+        real_w  = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        real_h  = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        orig_x  = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        orig_y  = user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+
+        # Tkinter logical screen size (always starts at 0,0)
+        tmp = tk.Toplevel(_tk_root)
+        tk_w = tmp.winfo_screenwidth()
+        tk_h = tmp.winfo_screenheight()
+        tmp.destroy()
+
+        scale_x = real_w / tk_w if tk_w > 0 else 1.0
+        scale_y = real_h / tk_h if tk_h > 0 else 1.0
+
+        return scale_x, scale_y, orig_x, orig_y
     except Exception:
-        pass
-    return 1.0, 1.0
+        return 1.0, 1.0, 0, 0
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -107,28 +116,35 @@ class SelectionOverlay:
         self.dragging = False
         self.dash_off = 0
         self.anim_id  = None
-        self.scale_x, self.scale_y = get_dpi_scale()
+        self.scale_x, self.scale_y, self.orig_x, self.orig_y = get_screen_info()
 
         tmp = tk.Toplevel(_tk_root)
         self.tk_sw = tmp.winfo_screenwidth()
         self.tk_sh = tmp.winfo_screenheight()
         tmp.destroy()
 
+        # Convert virtual screen origin to logical coords for window placement
+        log_orig_x = int(self.orig_x / self.scale_x)
+        log_orig_y = int(self.orig_y / self.scale_y)
+        # Full virtual desktop size in logical pixels
+        log_vw = int(self.tk_sw)
+        log_vh = int(self.tk_sh)
+
         self.win = tk.Toplevel(_tk_root)
         self.win.withdraw()
         self.win.overrideredirect(True)
-        self.win.geometry(f"{self.tk_sw}x{self.tk_sh}+0+0")
+        self.win.geometry(f"{log_vw}x{log_vh}+{log_orig_x}+{log_orig_y}")
         self.win.attributes("-topmost", True)
         self.win.attributes("-alpha", 0.15)
         self.win.configure(bg="black")
         self.win.config(cursor="crosshair")
 
-        self.cv = tk.Canvas(self.win, width=self.tk_sw, height=self.tk_sh,
+        self.cv = tk.Canvas(self.win, width=log_vw, height=log_vh,
                             bd=0, highlightthickness=0, bg="black")
         self.cv.pack(fill=tk.BOTH, expand=True)
 
-        self.hline = self.cv.create_line(0,0,self.tk_sw,0, fill=BLUE, width=1, dash=(5,4))
-        self.vline = self.cv.create_line(0,0,0,self.tk_sh, fill=BLUE, width=1, dash=(5,4))
+        self.hline = self.cv.create_line(0,0,log_vw,0, fill=BLUE, width=1, dash=(5,4))
+        self.vline = self.cv.create_line(0,0,0,log_vh, fill=BLUE, width=1, dash=(5,4))
 
         self.sel_fill  = None
         self.sel_outer = None
@@ -200,9 +216,12 @@ class SelectionOverlay:
         lx2 = int(max(self.start_x, e.x))
         ly2 = int(max(self.start_y, e.y))
 
-        # real pixel coords for ImageGrab
-        rx1 = int(lx1 * self.scale_x);  ry1 = int(ly1 * self.scale_y)
-        rx2 = int(lx2 * self.scale_x);  ry2 = int(ly2 * self.scale_y)
+        # Convert logical tkinter coords -> real pixel coords for ImageGrab
+        # orig_x/y accounts for monitors positioned left/above the primary
+        rx1 = int(lx1 * self.scale_x) + self.orig_x
+        ry1 = int(ly1 * self.scale_y) + self.orig_y
+        rx2 = int(lx2 * self.scale_x) + self.orig_x
+        ry2 = int(ly2 * self.scale_y) + self.orig_y
 
         # position for the floating snip window (logical coords)
         sx = max(0, lx1)
