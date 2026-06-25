@@ -9,6 +9,7 @@ import threading
 import os
 import io
 import ctypes
+import ctypes.wintypes
 from PIL import Image, ImageTk, ImageDraw, ImageGrab
 import pystray
 from pystray import MenuItem as item
@@ -170,9 +171,22 @@ def _open_overlay():
     def on_release(e):
         state["dragging"] = False
         if state["anim_id"]: win.after_cancel(state["anim_id"])
-        # Clamp coordinates to the canvas bounds (0..vw, 0..vh)
-        ex = max(0, min(e.x, vw))
-        ey = max(0, min(e.y, vh))
+
+        # Query the TRUE cursor position from Windows at release time.
+        # On fast drags, the release event's e.x/e.y can lag behind the
+        # actual cursor, so we use the OS cursor position as source of truth.
+        try:
+            pt = ctypes.wintypes.POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            # Convert screen coords -> canvas coords
+            end_x = pt.x - vl
+            end_y = pt.y - vt
+        except Exception:
+            end_x, end_y = e.x, e.y
+
+        # Clamp to canvas bounds
+        ex = max(0, min(end_x, vw))
+        ey = max(0, min(end_y, vh))
         sx = max(0, min(state["start_x"], vw))
         sy = max(0, min(state["start_y"], vh))
         rx1 = min(sx, ex);  ry1 = min(sy, ey)
