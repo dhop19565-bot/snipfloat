@@ -11,10 +11,9 @@ from PIL import Image, ImageTk, ImageDraw, ImageGrab
 import pystray
 from pystray import MenuItem as item
 
-# Tell Windows this process is DPI-aware so coordinates match pixels exactly
 try:
     import ctypes
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     try:
         ctypes.windll.user32.SetProcessDPIAware()
@@ -41,8 +40,8 @@ def _draw_scissors(d, size):
     s = size / 64
     def sp(x, y): return (x*s, y*s)
     def sr(*v):   return [i*s for i in v]
-    d.polygon([sp(10,10),sp(16,8),sp(54,44),sp(52,50),sp(46,48),sp(8,14)],  fill=ORANGE)
-    d.polygon([sp(8,50),sp(14,52),sp(52,16),sp(54,10),sp(48,8),sp(10,44)],  fill=ORANGE)
+    d.polygon([sp(10,10),sp(16,8),sp(54,44),sp(52,50),sp(46,48),sp(8,14)], fill=ORANGE)
+    d.polygon([sp(8,50),sp(14,52),sp(52,16),sp(54,10),sp(48,8),sp(10,44)], fill=ORANGE)
     cx,cy,r = 32*s,32*s,5*s
     d.ellipse([cx-r,cy-r,cx+r,cy+r], fill=GOLD, outline=ORANGE_DK, width=max(1,int(s)))
     d.ellipse(sr(1,40,21,62),  fill=ORANGE, outline=ORANGE_DK, width=max(1,int(1.5*s)))
@@ -74,6 +73,20 @@ def make_ico_file():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  DPI SCALE
+# ══════════════════════════════════════════════════════════════════════════
+def get_dpi_scale():
+    try:
+        import ctypes
+        dc  = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88)
+        ctypes.windll.user32.ReleaseDC(0, dc)
+        return dpi / 96.0
+    except Exception:
+        return 1.0
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  SELECTION OVERLAY
 # ══════════════════════════════════════════════════════════════════════════
 class SelectionOverlay:
@@ -83,44 +96,28 @@ class SelectionOverlay:
         self.dragging = False
         self.dash_off = 0
         self.anim_id  = None
+        self.scale    = get_dpi_scale()
 
-        # Get screen size in logical pixels
         tmp = tk.Toplevel(_tk_root)
-        tk_sw = tmp.winfo_screenwidth()
-        tk_sh = tmp.winfo_screenheight()
+        self.tk_sw = tmp.winfo_screenwidth()
+        self.tk_sh = tmp.winfo_screenheight()
         tmp.destroy()
-
-        # Work out DPI scale factor
-        try:
-            import ctypes
-            dc = ctypes.windll.user32.GetDC(0)
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88)  # LOGPIXELSX
-            ctypes.windll.user32.ReleaseDC(0, dc)
-            self.scale_x = dpi / 96.0
-            self.scale_y = dpi / 96.0
-        except Exception:
-            self.scale_x = 1.0
-            self.scale_y = 1.0
-
-        self.tk_sw = tk_sw
-        self.tk_sh = tk_sh
 
         self.win = tk.Toplevel(_tk_root)
         self.win.withdraw()
         self.win.overrideredirect(True)
-        self.win.geometry(f"{tk_sw}x{tk_sh}+0+0")
+        self.win.geometry(f"{self.tk_sw}x{self.tk_sh}+0+0")
         self.win.attributes("-topmost", True)
-        self.win.attributes("-alpha", 0.15)   # light grey wash — clicks register fine
+        self.win.attributes("-alpha", 0.15)
         self.win.configure(bg="black")
         self.win.config(cursor="crosshair")
 
-        self.cv = tk.Canvas(self.win, width=tk_sw, height=tk_sh,
+        self.cv = tk.Canvas(self.win, width=self.tk_sw, height=self.tk_sh,
                             bd=0, highlightthickness=0, bg="black")
         self.cv.pack(fill=tk.BOTH, expand=True)
 
-        # Crosshair
-        self.hline = self.cv.create_line(0,0,tk_sw,0, fill=BLUE, width=1, dash=(5,4))
-        self.vline = self.cv.create_line(0,0,0,tk_sh, fill=BLUE, width=1, dash=(5,4))
+        self.hline = self.cv.create_line(0,0,self.tk_sw,0, fill=BLUE, width=1, dash=(5,4))
+        self.vline = self.cv.create_line(0,0,0,self.tk_sh, fill=BLUE, width=1, dash=(5,4))
 
         self.sel_fill  = None
         self.sel_outer = None
@@ -148,7 +145,6 @@ class SelectionOverlay:
         self.dragging = True
         self.cv.itemconfigure(self.hline, state="hidden")
         self.cv.itemconfigure(self.vline, state="hidden")
-
         self.sel_fill  = self.cv.create_rectangle(e.x,e.y,e.x,e.y,
                              fill=BLUE, stipple="gray25", outline="")
         self.sel_outer = self.cv.create_rectangle(e.x,e.y,e.x,e.y,
@@ -165,7 +161,7 @@ class SelectionOverlay:
 
     def _update(self):
         x1,y1 = self.start_x,self.start_y
-        x2,y2 = self.cur_x,  self.cur_y
+        x2,y2 = self.cur_x,self.cur_y
         self.cv.coords(self.sel_fill,  x1,y1,x2,y2)
         self.cv.coords(self.sel_outer, x1,y1,x2,y2)
         self.cv.coords(self.sel_inner, x1,y1,x2,y2)
@@ -187,24 +183,42 @@ class SelectionOverlay:
         self.dragging = False
         if self.anim_id: self.win.after_cancel(self.anim_id)
 
-        # Convert tkinter coords → real pixel coords for the crop
-        x1 = int(min(self.start_x, e.x) * self.scale_x)
-        y1 = int(min(self.start_y, e.y) * self.scale_y)
-        x2 = int(max(self.start_x, e.x) * self.scale_x)
-        y2 = int(max(self.start_y, e.y) * self.scale_y)
+        # logical pixel coords of selection
+        lx1 = int(min(self.start_x, e.x))
+        ly1 = int(min(self.start_y, e.y))
+        lx2 = int(max(self.start_x, e.x))
+        ly2 = int(max(self.start_y, e.y))
+
+        # real pixel coords for ImageGrab
+        sc = self.scale
+        rx1 = int(lx1 * sc);  ry1 = int(ly1 * sc)
+        rx2 = int(lx2 * sc);  ry2 = int(ly2 * sc)
+
+        # position for the floating snip window (logical coords)
+        sx = max(0, lx1)
+        sy = max(0, ly1 - 30)
 
         self.win.destroy()
 
-        if (x2-x1) > 5 and (y2-y1) > 5:
-            sx = max(0, int(min(self.start_x, e.x)))
-            sy = max(0, int(min(self.start_y, e.y)) - 30)
-            # Destroy overlay first, wait for it to vanish, then grab
-            _tk_root.after(200, lambda: _do_grab(x1, y1, x2, y2, sx, sy))
+        if (lx2-lx1) > 5 and (ly2-ly1) > 5:
+            _tk_root.after(250, lambda: _do_grab(rx1, ry1, rx2, ry2, sx, sy))
 
     def _cancel(self):
         self.dragging = False
         if self.anim_id: self.win.after_cancel(self.anim_id)
         self.win.destroy()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  GRAB
+# ══════════════════════════════════════════════════════════════════════════
+def _do_grab(rx1, ry1, rx2, ry2, sx, sy):
+    try:
+        img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2), all_screens=True)
+        if img and img.size[0] > 0 and img.size[1] > 0:
+            FloatingSnip(img, x=sx, y=sy)
+    except Exception as ex:
+        print(f"Grab error: {ex}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -219,12 +233,13 @@ class FloatingSnip:
         self.win.configure(bg=DARK_BG)
 
         w,h = image.size
-        if w>900 or h>700:
+        if w > 900 or h > 700:
             image.thumbnail((900,700), Image.LANCZOS)
             w,h = image.size
 
         self.win.geometry(f"{w}x{h+30}+{x}+{y}")
 
+        # ── title bar ─────────────────────────────────────────────────
         bar = tk.Frame(self.win, bg=DARK_BG, height=30)
         bar.pack(fill=tk.X, side=tk.TOP)
         bar.pack_propagate(False)
@@ -238,16 +253,30 @@ class FloatingSnip:
                       activebackground=fg, activeforeground="white",
                       command=cmd).pack(side=tk.RIGHT)
 
+        # ── image ─────────────────────────────────────────────────────
         self.tk_img = ImageTk.PhotoImage(image)
-        cv = tk.Canvas(self.win, width=w, height=h,
-                       bd=0, highlightthickness=0, bg=DARK_BG, cursor="fleur")
-        cv.pack(fill=tk.BOTH, expand=True)
-        cv.create_image(0,0, anchor=tk.NW, image=self.tk_img)
+        self.cv = tk.Canvas(self.win, width=w, height=h,
+                            bd=0, highlightthickness=0, bg=DARK_BG, cursor="fleur")
+        self.cv.pack(fill=tk.BOTH, expand=True)
+        self.cv.create_image(0,0, anchor=tk.NW, image=self.tk_img)
 
+        # ── right-click context menu ───────────────────────────────────
+        self.menu = tk.Menu(self.win, tearoff=0,
+                            bg="#2a2a3e", fg="white",
+                            activebackground=BLUE, activeforeground="white",
+                            font=("Segoe UI", 10),
+                            relief=tk.FLAT, bd=0)
+        self.menu.add_command(label="📋  Copy",        command=self.copy)
+        self.menu.add_command(label="💾  Save as...",  command=self.save)
+        self.menu.add_separator()
+        self.menu.add_command(label="✕  Close",        command=self.close)
+
+        # ── drag + right-click bindings ────────────────────────────────
         self._dx = self._dy = 0
-        for widget in [bar, cv] + list(bar.winfo_children()):
-            widget.bind("<ButtonPress-1>", self._ds)
-            widget.bind("<B1-Motion>",     self._dm)
+        for widget in [bar, self.cv] + list(bar.winfo_children()):
+            widget.bind("<ButtonPress-1>",   self._ds)
+            widget.bind("<B1-Motion>",       self._dm)
+            widget.bind("<ButtonPress-3>",   self._show_menu)
 
         self.win.lift()
         snip_windows.append(self)
@@ -259,6 +288,12 @@ class FloatingSnip:
 
     def _dm(self, e):
         self.win.geometry(f"+{e.x_root-self._dx}+{e.y_root-self._dy}")
+
+    def _show_menu(self, e):
+        try:
+            self.menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            self.menu.grab_release()
 
     def copy(self):
         try:
@@ -285,15 +320,10 @@ class FloatingSnip:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  CAPTURE + TK + TRAY
+#  TK + TRAY
 # ══════════════════════════════════════════════════════════════════════════
 def take_snip():
     _tk_root.after(0, SelectionOverlay)
-
-def _do_grab(x1, y1, x2, y2, sx, sy):
-    # x1/y1/x2/y2 are already in real pixel coords (scaled)
-    img = ImageGrab.grab(bbox=(x1, y1, x2, y2))
-    FloatingSnip(img, x=sx, y=sy)
 
 def close_all_snips():
     for w in list(snip_windows): w.close()
