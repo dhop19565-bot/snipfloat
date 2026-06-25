@@ -211,7 +211,13 @@ class SelectionOverlay:
         self.win.destroy()
 
         if (lx2-lx1) > 5 and (ly2-ly1) > 5:
-            _tk_root.after(250, lambda: _do_grab(rx1, ry1, rx2, ry2, sx, sy))
+            # Grab in a background thread immediately — no delay needed
+            # since we destroyed the overlay window synchronously above
+            threading.Thread(
+                target=_do_grab,
+                args=(rx1, ry1, rx2, ry2, sx, sy),
+                daemon=True
+            ).start()
 
     def _cancel(self):
         self.dragging = False
@@ -224,22 +230,15 @@ class SelectionOverlay:
 # ══════════════════════════════════════════════════════════════════════════
 def _do_grab(rx1, ry1, rx2, ry2, sx, sy):
     try:
-        # Try without all_screens first (correct origin for single monitor)
         img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2))
         if img and img.size[0] > 0 and img.size[1] > 0:
-            # Sanity check: if image is mostly black, retry with all_screens
-            import numpy as np
-            arr = np.array(img.convert("L"))
-            if arr.mean() < 5:
-                img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2), all_screens=True)
-            FloatingSnip(img, x=sx, y=sy)
-    except ImportError:
-        # numpy not available, just grab normally
-        try:
-            img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2))
-            FloatingSnip(img, x=sx, y=sy)
-        except Exception as ex:
-            print(f"Grab error: {ex}")
+            try:
+                import numpy as np
+                if np.array(img.convert("L")).mean() < 5:
+                    img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2), all_screens=True)
+            except ImportError:
+                pass
+            _tk_root.after(0, lambda i=img: FloatingSnip(i, x=sx, y=sy))
     except Exception as ex:
         print(f"Grab error: {ex}")
 
