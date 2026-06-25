@@ -1,5 +1,7 @@
 """
-SnipFloat - System tray snipping tool for Windows
+DarcySnipTool - System tray snipping tool for Windows
+Uses raw Win32 for the selection overlay so it spans all monitors correctly.
+Ctrl+Shift+S or click tray icon to snip.
 """
 
 import tkinter as tk
@@ -7,12 +9,14 @@ from tkinter import filedialog
 import threading
 import os
 import io
+import ctypes
+import ctypes.wintypes
 from PIL import Image, ImageTk, ImageDraw, ImageGrab
 import pystray
 from pystray import MenuItem as item
 
+# ── DPI aware ─────────────────────────────────────────────────────────────
 try:
-    import ctypes
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     try:
@@ -31,6 +35,7 @@ ORANGE_DK = "#CC6600"
 GOLD      = "#FFD700"
 DARK_BG   = "#1e1e2e"
 BLUE      = "#7aa2f7"
+BLUE_RGB  = (0x7a, 0xa2, 0xf7)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -58,7 +63,7 @@ def make_tray_image():
 
 def make_ico_file():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)),"darcysniptool.ico")
-    sizes,frames = [256,64,48,32,16],[]
+    sizes, frames = [256,64,48,32,16], []
     for sz in sizes:
         f = Image.new("RGBA",(sz,sz),(0,0,0,0))
         d = ImageDraw.Draw(f)
@@ -73,193 +78,338 @@ def make_ico_file():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  SCREEN GEOMETRY  (multi-monitor + DPI aware)
+#  VIRTUAL DESKTOP  (real physical pixels, all monitors)
 # ══════════════════════════════════════════════════════════════════════════
-def get_screen_info():
+def get_virtual_desktop():
+    u = ctypes.windll.user32
+    l = u.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+    t = u.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+    w = u.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+    h = u.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+    return l, t, w, h
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  WIN32 OVERLAY  — pure ctypes, no tkinter, spans all monitors
+# ══════════════════════════════════════════════════════════════════════════
+# Win32 constants
+WS_POPUP          = 0x80000000
+WS_EX_TOPMOST     = 0x00000008
+WS_EX_TOOLWINDOW  = 0x00000080
+WS_EX_LAYERED     = 0x00080000
+WS_VISIBLE        = 0x10000000
+CS_HREDRAW        = 0x0002
+CS_VREDRAW        = 0x0001
+IDC_CROSS         = 32515
+WM_LBUTTONDOWN    = 0x0201
+WM_LBUTTONUP      = 0x0202
+WM_MOUSEMOVE      = 0x0200
+WM_KEYDOWN        = 0x0100
+WM_PAINT          = 0x000F
+WM_DESTROY        = 0x0002
+WM_ERASEBKGND     = 0x0014
+VK_ESCAPE         = 0x1B
+PS_SOLID          = 0
+PS_DOT            = 2
+LWA_ALPHA         = 0x00000002
+LWA_COLORKEY      = 0x00000001
+DIB_RGB_COLORS    = 0
+BI_RGB            = 0
+SRCCOPY           = 0x00CC0020
+TRANSPARENT       = 1
+OPAQUE            = 2
+
+user32 = ctypes.windll.user32
+gdi32  = ctypes.windll.gdi32
+kernel32 = ctypes.windll.kernel32
+
+WNDPROCTYPE = ctypes.WINFUNCTYPE(
+    ctypes.c_long, ctypes.wintypes.HWND,
+    ctypes.c_uint, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+
+
+class WNDCLASSEX(ctypes.Structure):
+    _fields_ = [
+        ("cbSize",        ctypes.c_uint),
+        ("style",         ctypes.c_uint),
+        ("lpfnWndProc",   WNDPROCTYPE),
+        ("cbClsExtra",    ctypes.c_int),
+        ("cbWndExtra",    ctypes.c_int),
+        ("hInstance",     ctypes.wintypes.HANDLE),
+        ("hIcon",         ctypes.wintypes.HANDLE),
+        ("hCursor",       ctypes.wintypes.HANDLE),
+        ("hbrBackground", ctypes.wintypes.HANDLE),
+        ("lpszMenuName",  ctypes.wintypes.LPCWSTR),
+        ("lpszClassName", ctypes.wintypes.LPCWSTR),
+        ("hIconSm",       ctypes.wintypes.HANDLE),
+    ]
+
+class PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("hdc",         ctypes.wintypes.HDC),
+        ("fErase",      ctypes.wintypes.BOOL),
+        ("rcPaint",     ctypes.wintypes.RECT),
+        ("fRestore",    ctypes.wintypes.BOOL),
+        ("fIncUpdate",  ctypes.wintypes.BOOL),
+        ("rgbReserved", ctypes.c_byte * 32),
+    ]
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize",          ctypes.c_uint32),
+        ("biWidth",         ctypes.c_int32),
+        ("biHeight",        ctypes.c_int32),
+        ("biPlanes",        ctypes.c_uint16),
+        ("biBitCount",      ctypes.c_uint16),
+        ("biCompression",   ctypes.c_uint32),
+        ("biSizeImage",     ctypes.c_uint32),
+        ("biXPelsPerMeter", ctypes.c_int32),
+        ("biYPelsPerMeter", ctypes.c_int32),
+        ("biClrUsed",       ctypes.c_uint32),
+        ("biClrImportant",  ctypes.c_uint32),
+    ]
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", BITMAPINFOHEADER),
+                ("bmiColors", ctypes.c_uint32 * 1)]
+
+
+def _run_win32_overlay(result_box, done_event):
     """
-    Returns (scale_x, scale_y, origin_x, origin_y).
-    origin_x/y is the top-left of the virtual desktop in real pixels
-    (negative when a monitor is to the left/above the primary).
-    scale_x/y converts tkinter logical pixels to real pixels.
+    Runs a pure Win32 fullscreen overlay covering all monitors.
+    Draws the pre-captured screenshot as background, then lets user drag
+    a selection rectangle. Returns selected coords in result_box.
     """
-    try:
-        import ctypes
-        user32 = ctypes.windll.user32
+    vl, vt, vw, vh = get_virtual_desktop()
 
-        # Virtual desktop in real pixels
-        real_w  = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
-        real_h  = user32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
-        orig_x  = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
-        orig_y  = user32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+    # Capture screen BEFORE showing anything
+    screenshot = ImageGrab.grab(bbox=(vl, vt, vl+vw, vt+vh), all_screens=True)
+    # Convert to BGR raw bytes for BitBlt
+    screenshot_rgb = screenshot.convert("RGB")
+    img_data = screenshot_rgb.tobytes("raw", "BGRX")
 
-        # Tkinter logical screen size (always starts at 0,0)
-        tmp = tk.Toplevel(_tk_root)
-        tk_w = tmp.winfo_screenwidth()
-        tk_h = tmp.winfo_screenheight()
-        tmp.destroy()
+    state = {
+        "dragging": False,
+        "x0": 0, "y0": 0,
+        "x1": 0, "y1": 0,
+        "hwnd": None,
+        "hdc_mem": None,
+        "hbm": None,
+    }
 
-        scale_x = real_w / tk_w if tk_w > 0 else 1.0
-        scale_y = real_h / tk_h if tk_h > 0 else 1.0
+    def make_color(r, g, b):
+        return r | (g << 8) | (b << 16)
 
-        return scale_x, scale_y, orig_x, orig_y
-    except Exception:
-        return 1.0, 1.0, 0, 0
+    BLUE_C  = make_color(0x7a, 0xa2, 0xf7)
+    WHITE_C = make_color(0xFF, 0xFF, 0xFF)
+    BLACK_C = make_color(0x00, 0x00, 0x00)
 
+    def draw(hwnd):
+        ps = PAINTSTRUCT()
+        hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
 
-# ══════════════════════════════════════════════════════════════════════════
-#  SELECTION OVERLAY
-# ══════════════════════════════════════════════════════════════════════════
-class SelectionOverlay:
-    def __init__(self):
-        self.start_x  = self.start_y = 0
-        self.cur_x    = self.cur_y   = 0
-        self.dragging = False
-        self.dash_off = 0
-        self.anim_id  = None
-        self.scale_x, self.scale_y, self.orig_x, self.orig_y = get_screen_info()
+        # Blit the screenshot
+        if state["hdc_mem"]:
+            gdi32.BitBlt(hdc, 0, 0, vw, vh, state["hdc_mem"], 0, 0, SRCCOPY)
 
-        tmp = tk.Toplevel(_tk_root)
-        self.tk_sw = tmp.winfo_screenwidth()
-        self.tk_sh = tmp.winfo_screenheight()
-        tmp.destroy()
+        # Dim overlay
+        hbr = gdi32.CreateSolidBrush(BLACK_C)
+        old_rop = gdi32.SetROP2(hdc, 6)  # R2_MASKPEN gives semi-transparent look
+        gdi32.SetROP2(hdc, old_rop)
 
-        # Convert virtual screen origin to logical coords for window placement
-        log_orig_x = int(self.orig_x / self.scale_x)
-        log_orig_y = int(self.orig_y / self.scale_y)
-        # Full virtual desktop size in logical pixels
-        log_vw = int(self.tk_sw)
-        log_vh = int(self.tk_sh)
+        if state["dragging"]:
+            x0,y0 = state["x0"]-vl, state["y0"]-vt
+            x1,y1 = state["x1"]-vl, state["y1"]-vt
+            rx1,ry1 = min(x0,x1), min(y0,y1)
+            rx2,ry2 = max(x0,x1), max(y0,y1)
 
-        self.win = tk.Toplevel(_tk_root)
-        self.win.withdraw()
-        self.win.overrideredirect(True)
-        self.win.geometry(f"{log_vw}x{log_vh}+{log_orig_x}+{log_orig_y}")
-        self.win.attributes("-topmost", True)
-        self.win.attributes("-alpha", 0.15)
-        self.win.configure(bg="black")
-        self.win.config(cursor="crosshair")
+            # Blue dashed selection rectangle
+            hpen_white = gdi32.CreatePen(PS_SOLID, 1, WHITE_C)
+            hpen_blue  = gdi32.CreatePen(PS_SOLID, 2, BLUE_C)
+            null_brush = gdi32.GetStockObject(5)  # NULL_BRUSH
 
-        self.cv = tk.Canvas(self.win, width=log_vw, height=log_vh,
-                            bd=0, highlightthickness=0, bg="black")
-        self.cv.pack(fill=tk.BOTH, expand=True)
+            gdi32.SelectObject(hdc, hpen_white)
+            gdi32.SelectObject(hdc, null_brush)
+            gdi32.Rectangle(hdc, rx1-1, ry1-1, rx2+1, ry2+1)
 
-        self.hline = self.cv.create_line(0,0,log_vw,0, fill=BLUE, width=1, dash=(5,4))
-        self.vline = self.cv.create_line(0,0,0,log_vh, fill=BLUE, width=1, dash=(5,4))
+            gdi32.SelectObject(hdc, hpen_blue)
+            gdi32.Rectangle(hdc, rx1, ry1, rx2, ry2)
 
-        self.sel_fill  = None
-        self.sel_outer = None
-        self.sel_inner = None
-        self.sel_label = None
+            # Size label
+            w_px = abs(state["x1"] - state["x0"])
+            h_px = abs(state["y1"] - state["y0"])
+            label = f" {w_px} x {h_px} px "
+            gdi32.SetBkMode(hdc, TRANSPARENT)
+            gdi32.SetTextColor(hdc, WHITE_C)
+            lx = rx2 + 6
+            ly = ry2 + 6
+            if lx + 100 > vw: lx = rx1 - 106
+            if ly + 20  > vh: ly = ry1 - 26
+            user32.TextOutW(hdc, lx, ly, label, len(label))
 
-        self.cv.bind("<Motion>",          self._move)
-        self.cv.bind("<ButtonPress-1>",   self._press)
-        self.cv.bind("<B1-Motion>",       self._drag)
-        self.cv.bind("<ButtonRelease-1>", self._release)
-        self.win.bind("<Escape>",         lambda e: self._cancel())
+            gdi32.DeleteObject(hpen_white)
+            gdi32.DeleteObject(hpen_blue)
+        else:
+            # Crosshair
+            hpen = gdi32.CreatePen(PS_DOT, 1, BLUE_C)
+            gdi32.SelectObject(hdc, hpen)
+            null_brush = gdi32.GetStockObject(5)
+            gdi32.SelectObject(hdc, null_brush)
+            mx,my = state["x1"]-vl, state["y1"]-vt
+            gdi32.MoveToEx(hdc, 0, my, None)
+            gdi32.LineTo(hdc, vw, my)
+            gdi32.MoveToEx(hdc, mx, 0, None)
+            gdi32.LineTo(hdc, mx, vh)
+            gdi32.DeleteObject(hpen)
 
-        self.win.deiconify()
-        self.win.lift()
-        self.win.focus_force()
+        gdi32.DeleteObject(hbr)
+        user32.EndPaint(hwnd, ctypes.byref(ps))
 
-    def _move(self, e):
-        if not self.dragging:
-            self.cv.coords(self.hline, 0, e.y, self.tk_sw, e.y)
-            self.cv.coords(self.vline, e.x, 0, e.x, self.tk_sh)
+    def GET_X(lparam): return ctypes.c_int16(lparam & 0xFFFF).value + vl
+    def GET_Y(lparam): return ctypes.c_int16((lparam >> 16) & 0xFFFF).value + vt
 
-    def _press(self, e):
-        self.start_x = self.cur_x = e.x
-        self.start_y = self.cur_y = e.y
-        self.dragging = True
-        self.cv.itemconfigure(self.hline, state="hidden")
-        self.cv.itemconfigure(self.vline, state="hidden")
-        self.sel_fill  = self.cv.create_rectangle(e.x,e.y,e.x,e.y,
-                             fill=BLUE, stipple="gray25", outline="")
-        self.sel_outer = self.cv.create_rectangle(e.x,e.y,e.x,e.y,
-                             outline="white", width=1)
-        self.sel_inner = self.cv.create_rectangle(e.x,e.y,e.x,e.y,
-                             outline=BLUE, width=2, dash=(6,4))
-        self.sel_label = self.cv.create_text(e.x+4,e.y+4, text="",
-                             fill="white", font=("Segoe UI",9,"bold"), anchor="nw")
-        self._animate()
-
-    def _drag(self, e):
-        self.cur_x, self.cur_y = e.x, e.y
-        self._update()
-
-    def _update(self):
-        x1,y1 = self.start_x,self.start_y
-        x2,y2 = self.cur_x,self.cur_y
-        self.cv.coords(self.sel_fill,  x1,y1,x2,y2)
-        self.cv.coords(self.sel_outer, x1,y1,x2,y2)
-        self.cv.coords(self.sel_inner, x1,y1,x2,y2)
-        w,h = abs(x2-x1), abs(y2-y1)
-        lx,ly = max(x1,x2)+4, max(y1,y2)+4
-        anch = "nw"
-        if lx+90 > self.tk_sw: lx = min(x1,x2)-4; anch="ne"
-        if ly+22 > self.tk_sh: ly = min(y1,y2)-4
-        self.cv.coords(self.sel_label, lx, ly)
-        self.cv.itemconfigure(self.sel_label, text=f" {w} × {h} ", anchor=anch)
-
-    def _animate(self):
-        if not self.dragging: return
-        self.dash_off = (self.dash_off+1) % 10
-        self.cv.itemconfigure(self.sel_inner, dashoffset=self.dash_off)
-        self.anim_id = self.win.after(60, self._animate)
-
-    def _release(self, e):
-        self.dragging = False
-        if self.anim_id: self.win.after_cancel(self.anim_id)
-
-        # logical pixel coords of selection
-        lx1 = int(min(self.start_x, e.x))
-        ly1 = int(min(self.start_y, e.y))
-        lx2 = int(max(self.start_x, e.x))
-        ly2 = int(max(self.start_y, e.y))
-
-        # Convert logical tkinter coords -> real pixel coords for ImageGrab
-        # orig_x/y accounts for monitors positioned left/above the primary
-        rx1 = int(lx1 * self.scale_x) + self.orig_x
-        ry1 = int(ly1 * self.scale_y) + self.orig_y
-        rx2 = int(lx2 * self.scale_x) + self.orig_x
-        ry2 = int(ly2 * self.scale_y) + self.orig_y
-
-        # position for the floating snip window (logical coords)
-        sx = max(0, lx1)
-        sy = max(0, ly1 - 30)
-
-        self.win.destroy()
-
-        if (lx2-lx1) > 5 and (ly2-ly1) > 5:
-            # Grab in a background thread immediately — no delay needed
-            # since we destroyed the overlay window synchronously above
-            threading.Thread(
-                target=_do_grab,
-                args=(rx1, ry1, rx2, ry2, sx, sy),
-                daemon=True
-            ).start()
-
-    def _cancel(self):
-        self.dragging = False
-        if self.anim_id: self.win.after_cancel(self.anim_id)
-        self.win.destroy()
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  GRAB
-# ══════════════════════════════════════════════════════════════════════════
-def _do_grab(rx1, ry1, rx2, ry2, sx, sy):
-    try:
-        img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2))
-        if img and img.size[0] > 0 and img.size[1] > 0:
-            try:
-                import numpy as np
-                if np.array(img.convert("L")).mean() < 5:
-                    img = ImageGrab.grab(bbox=(rx1, ry1, rx2, ry2), all_screens=True)
-            except ImportError:
+    def wnd_proc(hwnd, msg, wparam, lparam):
+        if msg == WM_MOUSEMOVE:
+            state["x1"] = GET_X(lparam)
+            state["y1"] = GET_Y(lparam)
+            if state["dragging"]:
                 pass
-            _tk_root.after(0, lambda i=img: FloatingSnip(i, x=sx, y=sy))
-    except Exception as ex:
-        print(f"Grab error: {ex}")
+            user32.InvalidateRect(hwnd, None, False)
+            return 0
+
+        elif msg == WM_LBUTTONDOWN:
+            state["dragging"] = True
+            state["x0"] = state["x1"] = GET_X(lparam)
+            state["y0"] = state["y1"] = GET_Y(lparam)
+            user32.SetCapture(hwnd)
+            return 0
+
+        elif msg == WM_LBUTTONUP:
+            user32.ReleaseCapture()
+            x0,y0 = state["x0"], state["y0"]
+            x1,y1 = GET_X(lparam), GET_Y(lparam)
+            rx1,ry1 = min(x0,x1), min(y0,y1)
+            rx2,ry2 = max(x0,x1), max(y0,y1)
+            if (rx2-rx1) > 5 and (ry2-ry1) > 5:
+                result_box.append((rx1, ry1, rx2, ry2))
+            user32.DestroyWindow(hwnd)
+            return 0
+
+        elif msg == WM_KEYDOWN:
+            if wparam == VK_ESCAPE:
+                user32.DestroyWindow(hwnd)
+            return 0
+
+        elif msg == WM_PAINT:
+            draw(hwnd)
+            return 0
+
+        elif msg == WM_ERASEBKGND:
+            return 1
+
+        elif msg == WM_DESTROY:
+            # Clean up GDI objects
+            if state["hdc_mem"]:
+                gdi32.DeleteDC(state["hdc_mem"])
+            if state["hbm"]:
+                gdi32.DeleteObject(state["hbm"])
+            user32.PostQuitMessage(0)
+            return 0
+
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    wnd_proc_cb = WNDPROCTYPE(wnd_proc)
+    hinstance   = kernel32.GetModuleHandleW(None)
+    class_name  = "DarcySnipOverlay"
+
+    wc = WNDCLASSEX()
+    wc.cbSize       = ctypes.sizeof(WNDCLASSEX)
+    wc.style        = CS_HREDRAW | CS_VREDRAW
+    wc.lpfnWndProc  = wnd_proc_cb
+    wc.hInstance    = hinstance
+    wc.hCursor      = user32.LoadCursorW(None, ctypes.cast(IDC_CROSS, ctypes.wintypes.LPCWSTR))
+    wc.hbrBackground= 0
+    wc.lpszClassName= class_name
+    user32.RegisterClassExW(ctypes.byref(wc))
+
+    hwnd = user32.CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        class_name, "DarcySnipTool",
+        WS_POPUP | WS_VISIBLE,
+        vl, vt, vw, vh,
+        None, None, hinstance, None
+    )
+    state["hwnd"] = hwnd
+
+    # Prepare off-screen DC with screenshot bitmap
+    hdc_screen = user32.GetDC(hwnd)
+    hdc_mem    = gdi32.CreateCompatibleDC(hdc_screen)
+    hbm        = gdi32.CreateCompatibleBitmap(hdc_screen, vw, vh)
+    gdi32.SelectObject(hdc_mem, hbm)
+
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize        = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth       = vw
+    bmi.bmiHeader.biHeight      = -vh   # negative = top-down
+    bmi.bmiHeader.biPlanes      = 1
+    bmi.bmiHeader.biBitCount    = 32
+    bmi.bmiHeader.biCompression = BI_RGB
+
+    buf = (ctypes.c_byte * len(img_data)).from_buffer_copy(img_data)
+    gdi32.SetDIBits(hdc_mem, hbm, 0, vh, buf,
+                    ctypes.byref(bmi), DIB_RGB_COLORS)
+    user32.ReleaseDC(hwnd, hdc_screen)
+
+    state["hdc_mem"] = hdc_mem
+    state["hbm"]     = hbm
+
+    user32.ShowWindow(hwnd, 1)
+    user32.SetForegroundWindow(hwnd)
+
+    # Message loop
+    msg = ctypes.wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+
+    # Store screenshot for cropping
+    result_box.append(screenshot)
+    done_event.set()
+    user32.UnregisterClassW(class_name, hinstance)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TAKE SNIP  — launches the Win32 overlay in a thread
+# ══════════════════════════════════════════════════════════════════════════
+def take_snip():
+    def _run():
+        result_box  = []
+        done_event  = threading.Event()
+        _run_win32_overlay(result_box, done_event)
+        done_event.wait()
+
+        # result_box = [coords_tuple (optional), screenshot_image]
+        # coords is first item if selection was made
+        coords     = None
+        screenshot = None
+        for item_ in result_box:
+            if isinstance(item_, tuple):
+                coords = item_
+            elif isinstance(item_, Image.Image):
+                screenshot = item_
+
+        if coords and screenshot:
+            rx1,ry1,rx2,ry2 = coords
+            vl,vt,vw,vh = get_virtual_desktop()
+            # Crop coords are relative to virtual desktop origin
+            cx1 = rx1 - vl
+            cy1 = ry1 - vt
+            cx2 = rx2 - vl
+            cy2 = ry2 - vt
+            cropped = screenshot.crop((cx1, cy1, cx2, cy2))
+            _tk_root.after(0, lambda: FloatingSnip(cropped, x=rx1, y=ry1))
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -280,31 +430,26 @@ class FloatingSnip:
 
         self.win.geometry(f"{w}x{h}+{x}+{y}")
 
-        # ── image ─────────────────────────────────────────────────────
         self.tk_img = ImageTk.PhotoImage(image)
         self.cv = tk.Canvas(self.win, width=w, height=h,
                             bd=0, highlightthickness=0, bg=DARK_BG, cursor="fleur")
         self.cv.pack(fill=tk.BOTH, expand=True)
         self.cv.create_image(0,0, anchor=tk.NW, image=self.tk_img)
 
-        # ── right-click context menu ───────────────────────────────────
         self.menu = tk.Menu(self.win, tearoff=0,
                             bg="#2a2a3e", fg="white",
                             activebackground=BLUE, activeforeground="white",
-                            font=("Segoe UI", 10),
-                            relief=tk.FLAT, bd=0)
-        self.menu.add_command(label="📋  Copy",        command=self.copy)
-        self.menu.add_command(label="💾  Save as...",  command=self.save)
+                            font=("Segoe UI",10), relief=tk.FLAT, bd=0)
+        self.menu.add_command(label="📋  Copy",       command=self.copy)
+        self.menu.add_command(label="💾  Save as...", command=self.save)
         self.menu.add_separator()
-        self.menu.add_command(label="✕  Close",        command=self.close)
+        self.menu.add_command(label="✕  Close",       command=self.close)
 
-        # ── drag + right-click bindings ────────────────────────────────
-        self._dx = self._dy = 0
-        for widget in [self.cv]:
-            widget.bind("<ButtonPress-1>",   self._ds)
-            widget.bind("<B1-Motion>",       self._dm)
-            widget.bind("<ButtonRelease-1>", self._click_dismiss)
-            widget.bind("<ButtonPress-3>",   self._show_menu)
+        self._dx = self._dy = self._moved = 0
+        self.cv.bind("<ButtonPress-1>",   self._ds)
+        self.cv.bind("<B1-Motion>",       self._dm)
+        self.cv.bind("<ButtonRelease-1>", self._click_dismiss)
+        self.cv.bind("<ButtonPress-3>",   self._show_menu)
 
         self.win.lift()
         snip_windows.append(self)
@@ -320,7 +465,6 @@ class FloatingSnip:
         self.win.geometry(f"+{e.x_root-self._dx}+{e.y_root-self._dy}")
 
     def _click_dismiss(self, e):
-        # Only dismiss if it was a clean click (not a drag)
         if not self._moved:
             self.close()
         self._moved = False
@@ -356,21 +500,18 @@ class FloatingSnip:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  TK + TRAY
+#  TK + TRAY + HOTKEY
 # ══════════════════════════════════════════════════════════════════════════
-def take_snip():
-    _tk_root.after(0, SelectionOverlay)
+def close_all_snips():
+    for w in list(snip_windows): w.close()
 
 def _start_hotkey_listener():
     try:
         import keyboard
         keyboard.add_hotkey("ctrl+shift+s", take_snip)
-        keyboard.wait()   # blocks this thread forever, listening for hotkeys
+        keyboard.wait()
     except ImportError:
-        pass  # keyboard package not available — hotkey simply won't work
-
-def close_all_snips():
-    for w in list(snip_windows): w.close()
+        pass
 
 def _run_tk():
     global _tk_root
@@ -400,6 +541,5 @@ if __name__ == "__main__":
     make_ico_file()
     threading.Thread(target=_run_tk, daemon=True).start()
     _tk_ready.wait()
-    # Start global hotkey listener (Ctrl+Shift+S) in background thread
     threading.Thread(target=_start_hotkey_listener, daemon=True).start()
     build_tray()
