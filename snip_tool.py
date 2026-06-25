@@ -244,9 +244,6 @@ class FloatingSnip:
         self.win.configure(bg=DARK_BG)
 
         w,h = image.size
-        if w > 900 or h > 700:
-            image.thumbnail((900,700), Image.LANCZOS)
-            w,h = image.size
 
         self.win.geometry(f"{w}x{h}+{x}+{y}")
 
