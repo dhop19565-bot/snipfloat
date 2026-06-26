@@ -27,9 +27,28 @@ jobs:
           choco install upx -y
 
       - name: Build EXE
-        run: |
-          python -c "from snip_tool import make_ico_file; make_ico_file()"
-          pyinstaller --onefile --windowed --name DarcySnipTool --icon=darcysniptool.ico --upx-dir="C:\ProgramData\chocolatey\bin" --exclude-module numpy --exclude-module matplotlib --exclude-module scipy --exclude-module pandas --exclude-module tkinter.test snip_tool.py --clean --noconfirm
+        run: >
+          python -c "from snip_tool import make_ico_file; make_ico_file()" ;
+          pyinstaller --onefile --windowed --name DarcySnipTool --icon=darcysniptool.ico
+          --upx-dir="C:\ProgramData\chocolatey\bin"
+          --exclude-module numpy
+          --exclude-module matplotlib
+          --exclude-module scipy
+          --exclude-module pandas
+          --exclude-module PIL.ImageQt
+          --exclude-module PIL.ImageFont
+          --exclude-module PIL.ImageCms
+          --exclude-module PIL.PdfParser
+          --exclude-module unittest
+          --exclude-module pydoc
+          --exclude-module doctest
+          --exclude-module pytest
+          --exclude-module test
+          --exclude-module sqlite3
+          snip_tool.py --clean --noconfirm
+
+      - name: Show final size
+        run: dir dist
 
       - name: Upload EXE as artifact
         uses: actions/upload-artifact@v4
