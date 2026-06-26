@@ -1,4 +1,4 @@
-name: Build SnipFloat EXE
+name: Build DarcySnipTool EXE
 
 on:
   push:
@@ -20,15 +20,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pillow pystray pywin32 pyinstaller
+          pip install pillow pystray pywin32 pyinstaller keyboard
+
+      - name: Install UPX
+        run: |
+          choco install upx -y
 
       - name: Build EXE
         run: |
           python -c "from snip_tool import make_ico_file; make_ico_file()"
-          pyinstaller --onefile --windowed --name SnipFloat --icon=snipfloat.ico snip_tool.py --clean --noconfirm
+          pyinstaller --onefile --windowed --name DarcySnipTool --icon=darcysniptool.ico --upx-dir="C:\ProgramData\chocolatey\bin" --exclude-module numpy --exclude-module matplotlib --exclude-module scipy --exclude-module pandas --exclude-module tkinter.test snip_tool.py --clean --noconfirm
 
       - name: Upload EXE as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SnipFloat-Windows
-          path: dist/SnipFloat.exe
+          name: DarcySnipTool-Windows
+          path: dist/DarcySnipTool.exe
