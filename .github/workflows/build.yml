@@ -19,18 +19,20 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install pillow pystray pywin32 pyinstaller keyboard pytesseract winsdk
+        run: |
+          pip install pillow pystray pywin32 pyinstaller keyboard numpy
+          pip install rapidocr-onnxruntime
+          pip install pytesseract winsdk
 
       - name: Install Tesseract OCR (fallback engine)
         run: choco install tesseract -y --no-progress
         shell: pwsh
 
-      - name: Locate and stage Tesseract for bundling
+      - name: Stage Tesseract for bundling
         run: |
           $tessExe = (Get-Command tesseract -ErrorAction SilentlyContinue).Source
           if (-not $tessExe) { $tessExe = "C:\Program Files\Tesseract-OCR\tesseract.exe" }
           $tessDir = Split-Path $tessExe
-          echo "Tesseract dir: $tessDir"
           New-Item -ItemType Directory -Force -Path tesseract | Out-Null
           Copy-Item "$tessDir\*" -Destination tesseract -Recurse -Force
           if (Test-Path "$tessDir\tessdata") {
@@ -40,22 +42,17 @@ jobs:
           Get-ChildItem tesseract | Select-Object Name
         shell: pwsh
 
-      - name: Download UPX
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip" -OutFile upx.zip
-          Expand-Archive -Path upx.zip -DestinationPath upx_extract
-          $upxPath = (Get-ChildItem -Path upx_extract -Recurse -Filter upx.exe | Select-Object -First 1).DirectoryName
-          echo "UPX_DIR=$upxPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-        shell: pwsh
-
       - name: Build EXE
         run: >
           python -c "from snip_tool import make_ico_file; make_ico_file()" ;
           pyinstaller --onefile --windowed --name DarcySnipTool --icon=darcysniptool.ico
-          --upx-dir="${env:UPX_DIR}"
           --add-data "tesseract;tesseract"
+          --collect-all rapidocr_onnxruntime
+          --collect-all onnxruntime
+          --collect-data rapidocr_onnxruntime
+          --hidden-import numpy
+          --hidden-import onnxruntime
           --collect-all winsdk
-          --exclude-module numpy
           --exclude-module matplotlib
           --exclude-module scipy
           --exclude-module pandas
