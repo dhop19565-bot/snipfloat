@@ -286,7 +286,6 @@ def _windows_ocr_text(pil_image):
 
         img = pil_image.convert("RGBA")
         w, h = img.size
-        # BGRA byte order for Windows
         data = img.tobytes("raw", "BGRA")
         buf = CryptographicBuffer.create_from_byte_array(list(data))
         bmp = SoftwareBitmap.create_copy_from_buffer(
@@ -294,8 +293,7 @@ def _windows_ocr_text(pil_image):
 
         import asyncio
         async def _run():
-            result = await engine.recognize_async(bmp)
-            return result
+            return await engine.recognize_async(bmp)
 
         try:
             loop = asyncio.new_event_loop()
@@ -307,11 +305,7 @@ def _windows_ocr_text(pil_image):
         if result is None:
             return None
 
-        # Preserve line structure
-        lines = []
-        for line in result.lines:
-            lines.append(line.text)
-        return "\n".join(lines)
+        return "\n".join(line.text for line in result.lines)
     except Exception:
         return None
 
@@ -407,11 +401,11 @@ def _extract_and_sum(text):
 
 
 def _detect_currency(text):
-    """Return the first currency symbol found in the OCR text, or ''."""
+    """Return the first currency symbol found in the OCR text, or GBP default."""
     for sym in ("£", "$", "€"):
         if sym in text:
             return sym
-    return ""
+    return "£"   # default for this user's F&O entity (GBP)
 
 
 def _fmt_num(n, currency=""):
@@ -438,9 +432,19 @@ def _ocr_image(pil_image):
             factor = max(2, 1400 // max(w, h))
             wimg = wimg.resize((w*factor, h*factor), Image.LANCZOS)
         wimg = wimg.filter(ImageFilter.SHARPEN)
+
+        # Normalise contrast so a highlighted (e.g. blue-selected) row reads
+        # the same as the plain rows around it.
+        wimg = ImageOps.autocontrast(wimg, cutoff=1)
+
         hist = wimg.histogram()
         if sum(hist[:128]) > sum(hist[128:]):      # dark mode
             wimg = ImageOps.invert(wimg)
+
+        # Pad with a generous white border so the top/bottom rows never sit
+        # flush against the edge (OCR engines routinely drop edge-touching text).
+        wimg = ImageOps.expand(wimg, border=50, fill=255)
+
         wtext = _windows_ocr_text(wimg.convert("RGB"))
         if wtext and any(ch.isdigit() for ch in wtext):
             text = wtext
