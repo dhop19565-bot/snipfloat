@@ -3,3 +3,4 @@ pystray>=0.19.0
 pywin32>=306
 keyboard>=0.13.5
 pytesseract>=0.3.10
+winsdk>=1.0.0b10
