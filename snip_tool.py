@@ -218,8 +218,10 @@ def _open_overlay(sum_mode=False):
                         bbox=(real_x1, real_y1, real_x2, real_y2),
                         all_screens=True)
                     if sum_mode:
-                        # Snip-and-sum: skip the floating window, OCR directly
-                        _sum_image_directly(img)
+                        # Snip-and-sum: show the total right beside the snip,
+                        # anchored to the top-right corner of the selection.
+                        near = (real_x2, real_y1)
+                        _sum_image_directly(img, near_pos=near)
                     else:
                         FloatingSnip(img, x=real_x1, y=real_y1)
                 except Exception:
@@ -242,6 +244,63 @@ def _open_overlay(sum_mode=False):
 #  OCR HELPERS  (used by "Sum numbers")
 # ══════════════════════════════════════════════════════════════════════════
 import re
+
+# ── RapidOCR (neural OCR, runs fully offline) — PRIMARY ENGINE ────────────
+_rapid_engine = None
+_rapid_checked = False
+
+def _get_rapidocr():
+    """Return a RapidOCR engine if available, else None (cached)."""
+    global _rapid_engine, _rapid_checked
+    if _rapid_checked:
+        return _rapid_engine
+    _rapid_checked = True
+    try:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            from rapidocr import RapidOCR
+        _rapid_engine = RapidOCR()
+    except Exception:
+        _rapid_engine = None
+    return _rapid_engine
+
+
+def _rapidocr_read(pil_image):
+    """
+    Run RapidOCR on a PIL image.
+    Returns (text, min_confidence) with lines ordered top-to-bottom,
+    or None if unavailable / nothing found.
+    """
+    try:
+        engine = _get_rapidocr()
+        if engine is None:
+            return None
+        import numpy as np
+        arr = np.array(pil_image.convert("RGB"))
+        result, _elapse = engine(arr)
+        if not result:
+            return None
+
+        items = []
+        for entry in result:
+            try:
+                box, txt, score = entry[0], entry[1], entry[2]
+                cy = sum(p[1] for p in box) / len(box)
+                items.append((cy, str(txt), float(score)))
+            except Exception:
+                continue
+        if not items:
+            return None
+
+        items.sort(key=lambda it: it[0])          # preserve row order
+        text = "\n".join(t for _cy, t, _s in items)
+        confs = [s for _cy, t, s in items if any(c.isdigit() for c in t)]
+        min_conf = min(confs) if confs else None
+        return text, min_conf
+    except Exception:
+        return None
+
 
 # ── Windows native OCR (Windows.Media.Ocr) ─────────────────────────────────
 _win_ocr_engine = None
@@ -349,6 +408,15 @@ def _extract_and_sum(text):
     the start of the next line is never stolen by the number above it.
     Returns (list_of_numbers, total).
     """
+    # Normalise Unicode look-alikes that OCR engines often emit
+    # (full-width parens/minus, en/em dashes, fancy quotes for thousands).
+    text = (text or "")
+    for a, b in (("（", "("), ("）", ")"),
+                 ("−", "-"), ("–", "-"), ("—", "-"), ("‒", "-"),
+                 ("，", ","), ("．", "."), ("﹒", "."),
+                 ("｜", "|")):
+        text = text.replace(a, b)
+
     numbers = []
     # [ \t]* (not \s*) keeps tokens from spanning newlines.
     token_re = re.compile(r'\(?[-+]?[£$€]?[ \t]*\d[\d.,]*-?%?\)?')
@@ -359,7 +427,8 @@ def _extract_and_sum(text):
             continue
 
         negative = False
-        if "(" in token and ")" in token:
+        # Accounting negatives: accept either paren, since OCR can drop one
+        if "(" in token or ")" in token:
             negative = True
 
         first_digit = next(i for i, ch in enumerate(token) if ch.isdigit())
@@ -417,85 +486,204 @@ def _fmt_num(n, currency=""):
     return f"{currency}{body}" if currency else body
 
 
-# ── Shared OCR core: image -> (numbers, total, min_conf, currency) ─────────
-def _ocr_image(pil_image):
-    """Run OCR (Windows native first, Tesseract fallback) and extract numbers."""
-    from PIL import ImageOps, ImageFilter, ImageEnhance
-    text = None
-    min_conf = None
-
-    # 1. Windows native OCR — best on clean on-screen text
+# ── Row counting: how many lines of text are actually in the snip? ─────────
+def _count_text_rows(pil_img):
+    """
+    Count horizontal bands of text via a projection profile.
+    Lets us tell when OCR has silently missed a row.
+    """
     try:
-        wimg = pil_image.convert("L")
-        w, h = wimg.size
-        if max(w, h) < 1400:
-            factor = max(2, 1400 // max(w, h))
-            wimg = wimg.resize((w*factor, h*factor), Image.LANCZOS)
-        wimg = wimg.filter(ImageFilter.SHARPEN)
-
-        # Normalise contrast so a highlighted (e.g. blue-selected) row reads
-        # the same as the plain rows around it.
-        wimg = ImageOps.autocontrast(wimg, cutoff=1)
-
-        hist = wimg.histogram()
-        if sum(hist[:128]) > sum(hist[128:]):      # dark mode
-            wimg = ImageOps.invert(wimg)
-
-        # Pad with a generous white border so the top/bottom rows never sit
-        # flush against the edge (OCR engines routinely drop edge-touching text).
-        wimg = ImageOps.expand(wimg, border=50, fill=255)
-
-        wtext = _windows_ocr_text(wimg.convert("RGB"))
-        if wtext and any(ch.isdigit() for ch in wtext):
-            text = wtext
+        from PIL import ImageOps
+        g = pil_img.convert("L")
+        w, h = g.size
+        if h < 20 or w < 10:
+            return 0
+        g = ImageOps.autocontrast(g, cutoff=1)
+        px = g.load()
+        hist = g.histogram()
+        dark_bg = sum(hist[:128]) > sum(hist[128:])
+        step = max(1, w // 200)
+        samples = len(range(0, w, step))
+        thresh = max(1, int(0.02 * samples))
+        bands, in_band, start = 0, False, 0
+        for y in range(h):
+            ink = 0
+            for x in range(0, w, step):
+                v = px[x, y]
+                if (v > 170) if dark_bg else (v < 110):
+                    ink += 1
+            if ink >= thresh and not in_band:
+                in_band, start = True, y
+            elif ink < thresh and in_band:
+                in_band = False
+                if y - start >= 3:
+                    bands += 1
+        if in_band and h - start >= 3:
+            bands += 1
+        return bands
     except Exception:
-        text = None
+        return 0
 
-    # 2. Tesseract fallback
-    if text is None:
+
+# ── Preprocessing variants for multi-pass OCR ─────────────────────────────
+def _ocr_variants(pil_image):
+    """Yield several differently-processed versions of the snip."""
+    from PIL import ImageOps, ImageFilter, ImageEnhance
+    out = []
+    try:
+        base = pil_image.convert("L")
+        w, h = base.size
+        hist = base.histogram()
+        dark_bg = sum(hist[:128]) > sum(hist[128:])
+        if dark_bg:
+            base = ImageOps.invert(base)
+
+        target = 1600
+        scales = []
+        for s in (3, 4, 5):
+            if max(w, h) * s <= 6000:
+                scales.append(s)
+        if not scales:
+            scales = [2]
+
+        for s in scales:
+            im = base.resize((w*s, h*s), Image.LANCZOS).filter(ImageFilter.SHARPEN)
+            ac = ImageOps.autocontrast(im, cutoff=1)
+            # A: normalised contrast
+            out.append(ImageOps.expand(ac, border=60, fill=255))
+            # B: hard binarised
+            out.append(ImageOps.expand(
+                ac.point(lambda p: 255 if p > 160 else 0), border=60, fill=255))
+            # C: strong contrast boost
+            out.append(ImageOps.expand(
+                ImageEnhance.Contrast(ac).enhance(2.0), border=60, fill=255))
+    except Exception:
+        pass
+    return out
+
+
+# ── Shared OCR core: multi-pass with consensus voting ─────────────────────
+def _ocr_image(pil_image):
+    """
+    Run OCR across several preprocessing variants and both available engines,
+    then pick the result that MOST passes agree on (consensus voting).
+    This rejects one-off misreads that a single pass would accept.
+    Returns (numbers, total, agreement_ratio, currency, expected_rows) or None.
+    """
+    from collections import Counter
+
+    expected_rows = _count_text_rows(pil_image)
+
+    # ── PRIMARY: RapidOCR (neural, offline) ───────────────────────────────
+    # Accurate enough that it needs no preprocessing; try it plain first,
+    # then lightly upscaled if the row count looks short.
+    rapid = _rapidocr_read(pil_image)
+    if rapid is None:
         try:
-            import pytesseract
-            _configure_tesseract()
-            img = pil_image.convert("L")
-            w, h = img.size
-            if max(w, h) < 1400:
-                factor = max(3, 1400 // max(w, h))
-                img = img.resize((w*factor, h*factor), Image.LANCZOS)
-            img = img.filter(ImageFilter.SHARPEN)
-            img = ImageOps.autocontrast(img, cutoff=2)
-            img = ImageEnhance.Contrast(img).enhance(1.5)
-            hist_mean = int(sum(i*c for i, c in enumerate(img.histogram()))
-                            / max(1, sum(img.histogram())))
-            threshold = max(120, min(200, hist_mean))
-            bw = img.point(lambda p: 255 if p > threshold else 0)
-            if bw.histogram()[0] > bw.histogram()[255]:
-                bw = ImageOps.invert(bw)
-            bw = ImageOps.expand(bw, border=40, fill=255)
-            whitelist = "0123456789.,-()£$€%"
-            config = f"--psm 6 -c tessedit_char_whitelist={whitelist}"
-            data = pytesseract.image_to_data(
-                bw, config=config, output_type=pytesseract.Output.DICT)
-            words, confs = [], []
-            for i, word in enumerate(data.get("text", [])):
-                word = word.strip()
-                if not word:
-                    continue
-                try:
-                    conf = float(data["conf"][i])
-                except (ValueError, KeyError, IndexError):
-                    conf = -1
-                if any(ch.isdigit() for ch in word):
-                    words.append(word)
-                    if conf >= 0:
-                        confs.append(conf)
-            text = "\n".join(words)
-            min_conf = min(confs) if confs else None
+            from PIL import ImageOps
+            big = pil_image.convert("RGB")
+            w, h = big.size
+            if max(w, h) < 800:
+                big = big.resize((w*2, h*2), Image.LANCZOS)
+            rapid = _rapidocr_read(big)
         except Exception:
-            return None   # signals "no OCR engine / error"
+            rapid = None
 
-    currency = _detect_currency(text or "")
-    numbers, total = _extract_and_sum(text or "")
-    return numbers, total, min_conf, currency
+    if rapid is not None:
+        rtext, rconf = rapid
+        rnums, rtotal = _extract_and_sum(rtext)
+        if rnums:
+            # If it found at least as many values as there are rows, trust it.
+            if not expected_rows or len(rnums) >= expected_rows:
+                return (rnums, rtotal,
+                        (rconf if rconf is not None else 1.0),
+                        _detect_currency(rtext), expected_rows)
+            # Short read — retry once upscaled before falling through
+            try:
+                w, h = pil_image.size
+                big = pil_image.convert("RGB").resize(
+                    (w*3, h*3), Image.LANCZOS)
+                r2 = _rapidocr_read(big)
+                if r2:
+                    t2, c2 = r2
+                    n2, tot2 = _extract_and_sum(t2)
+                    if n2 and len(n2) >= len(rnums):
+                        return (n2, tot2, (c2 if c2 is not None else 1.0),
+                                _detect_currency(t2), expected_rows)
+            except Exception:
+                pass
+            return (rnums, rtotal,
+                    (rconf if rconf is not None else 1.0),
+                    _detect_currency(rtext), expected_rows)
+
+    # ── FALLBACK: multi-pass consensus across Windows OCR + Tesseract ─────
+    variants = _ocr_variants(pil_image)
+    if not variants:
+        variants = [pil_image]
+
+    candidates = []      # list of (tuple_of_numbers, source_text)
+
+    # --- Engine: Windows native OCR ---
+    for v in variants:
+        try:
+            t = _windows_ocr_text(v.convert("RGB"))
+            if t and any(ch.isdigit() for ch in t):
+                nums, _ = _extract_and_sum(t)
+                if nums:
+                    candidates.append((tuple(nums), t))
+        except Exception:
+            pass
+
+    # --- Engine 2: Tesseract ---
+    try:
+        import pytesseract
+        _configure_tesseract()
+        whitelist = "0123456789.,-()£$€%"
+        cfgs = [
+            f"--psm 6 -c tessedit_char_whitelist={whitelist}",
+            f"--psm 4 -c tessedit_char_whitelist={whitelist}",
+        ]
+        for v in variants:
+            for cfg in cfgs:
+                try:
+                    t = pytesseract.image_to_string(v, config=cfg)
+                    if t and any(ch.isdigit() for ch in t):
+                        nums, _ = _extract_and_sum(t)
+                        if nums:
+                            candidates.append((tuple(nums), t))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if not candidates:
+        return None
+
+    # Consensus vote on the exact sequence of numbers
+    votes = Counter(c[0] for c in candidates)
+
+    # Prefer the most-voted result; if a result matches the detected row
+    # count and another doesn't, favour the matching one.
+    def score(item):
+        seq, n = item
+        matches_rows = (expected_rows > 0 and len(seq) == expected_rows)
+        return (matches_rows, n, len(seq))
+
+    best_seq, best_votes = max(votes.items(), key=score)
+
+    numbers = list(best_seq)
+    total = sum(numbers)
+    agreement = best_votes / max(1, len(candidates))
+
+    # Currency from the text of a winning pass
+    text_for_cur = ""
+    for seq, t in candidates:
+        if seq == best_seq:
+            text_for_cur = t
+            break
+    currency = _detect_currency(text_for_cur)
+
+    return numbers, total, agreement, currency, expected_rows
 
 
 # ── Running tally across snips ─────────────────────────────────────────────
@@ -503,29 +691,41 @@ _running_tally = []          # list of individual numbers accumulated
 _tally_enabled = False       # toggle from tray
 
 
-def _sum_image_directly(pil_image):
+def _sum_image_directly(pil_image, near_pos=None):
     """Snip-and-sum in one action: OCR then show a toast, no floating window."""
     def worker():
         result = _ocr_image(pil_image)
         if result is None:
             _tk_root.after(0, lambda: show_toast(
-                "OCR unavailable", subtitle="No OCR engine found", accent=AMBER))
+                "No numbers found", subtitle="Try a tighter snip",
+                accent=AMBER, near_pos=near_pos))
             return
-        numbers, total, min_conf, currency = result
+        numbers, total, agreement, currency, rows = result
         _tk_root.after(0, lambda: _present_sum(
-            numbers, total, min_conf, currency))
+            numbers, total, agreement, currency, near_pos, rows))
     threading.Thread(target=worker, daemon=True).start()
 
 
-def _present_sum(numbers, total, min_conf, currency):
+def _present_sum(numbers, total, agreement, currency, near_pos=None, rows=0):
     """Show a sum result toast; feed the running tally if enabled."""
     global _running_tally
     if not numbers:
         show_toast("No numbers found", subtitle="Try a tighter snip",
-                   accent=AMBER)
+                   accent=AMBER, near_pos=near_pos)
         return
 
-    # Running tally mode: accumulate and show the grand total
+    count = len(numbers)
+
+    # Build any warnings
+    warns = []
+    if rows and count < rows:
+        warns.append(f"⚠ only read {count} of {rows} rows")
+    elif rows and count > rows:
+        warns.append(f"⚠ read {count} values from {rows} rows")
+    if agreement is not None and agreement < 0.75:
+        warns.append("⚠ low confidence — check figures")
+
+    # Running tally mode
     if _tally_enabled:
         _running_tally.extend(numbers)
         grand = sum(_running_tally)
@@ -534,30 +734,29 @@ def _present_sum(numbers, total, min_conf, currency):
             _tk_root.clipboard_append(_fmt_num(grand).replace(",", ""))
         except Exception:
             pass
-        show_toast(
-            f"Running total:  {_fmt_num(grand, currency)}",
-            subtitle=(f"+{_fmt_num(total, currency)} this snip  ·  "
-                      f"{len(_running_tally)} values total"),
-            accent=BLUE, numbers=numbers, currency=currency)
+        sub = (f"+{_fmt_num(total, currency)} this snip  ·  "
+               f"{len(_running_tally)} values total")
+        if warns:
+            sub += "  ·  " + "  ".join(warns)
+        show_toast(f"Running total:  {_fmt_num(grand, currency)}",
+                   subtitle=sub, accent=(AMBER if warns else BLUE),
+                   numbers=numbers, currency=currency, near_pos=near_pos)
         return
 
     # Normal one-shot sum
-    total_str = _fmt_num(total, currency)
     try:
         _tk_root.clipboard_clear()
         _tk_root.clipboard_append(_fmt_num(total).replace(",", ""))
     except Exception:
         pass
-    count = len(numbers)
-    avg   = total / count if count else 0
-    low   = (min_conf is not None and min_conf < 75)
+    avg = total / count if count else 0
     stats = (f"{count} value{'s' if count != 1 else ''}  ·  "
              f"avg {_fmt_num(avg, currency)}")
-    if low:
-        stats += "  ·  ⚠ check figures"
-    show_toast(f"Total:  {total_str}", subtitle=stats,
-               accent=(AMBER if low else GREEN),
-               numbers=numbers, currency=currency)
+    if warns:
+        stats += "  ·  " + "  ".join(warns)
+    show_toast(f"Total:  {_fmt_num(total, currency)}", subtitle=stats,
+               accent=(AMBER if warns else GREEN),
+               numbers=numbers, currency=currency, near_pos=near_pos)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -565,8 +764,11 @@ def _present_sum(numbers, total, min_conf, currency):
 # ══════════════════════════════════════════════════════════════════════════
 _active_toasts = []
 
-def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=4200, currency=""):
-    """Show a small notification in the bottom-right corner that fades away."""
+def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=4200,
+               currency="", near_pos=None):
+    """Show a small notification that fades away.
+    If near_pos=(x, y) is given, appear next to that screen point (the snip);
+    otherwise appear in the bottom-right corner."""
     try:
         toast = tk.Toplevel(_tk_root)
         toast.overrideredirect(True)
@@ -603,19 +805,36 @@ def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=4200, cur
                      font=("Consolas", 8), anchor="w",
                      justify="left").pack(anchor="w", pady=(4, 0))
 
-        # Size & position: bottom-right, stacked above existing toasts
         toast.update_idletasks()
         tw = toast.winfo_width()
         th = toast.winfo_height()
         sw = toast.winfo_screenwidth()
         sh = toast.winfo_screenheight()
         margin = 18
-        taskbar = 48
-        offset  = sum(t.winfo_height() + 10 for t in _active_toasts
-                      if t.winfo_exists())
-        x = sw - tw - margin
-        y = sh - th - taskbar - margin - offset
-        toast.geometry(f"+{x}+{y}")
+
+        if near_pos is not None:
+            # Appear just to the right of (and level with) the selection.
+            nx, ny = near_pos
+            x = nx + 12
+            y = ny
+            # Keep it fully on-screen
+            if x + tw + margin > sw:      # would overflow right → put on left
+                x = nx - tw - 12
+            if x < margin:
+                x = margin
+            if y + th + margin > sh:
+                y = sh - th - margin
+            if y < margin:
+                y = margin
+        else:
+            # Bottom-right, stacked above existing toasts
+            taskbar = 48
+            offset  = sum(t.winfo_height() + 10 for t in _active_toasts
+                          if t.winfo_exists())
+            x = sw - tw - margin
+            y = sh - th - taskbar - margin - offset
+
+        toast.geometry(f"+{int(x)}+{int(y)}")
 
         _active_toasts.append(toast)
 
@@ -750,16 +969,22 @@ class FloatingSnip:
         if p: self.image.save(p)
 
     def sum_numbers(self):
+        # Anchor the result toast to the top-right of this snip window
+        try:
+            near = (self.win.winfo_x() + self.win.winfo_width(),
+                    self.win.winfo_y())
+        except Exception:
+            near = None
         def worker():
             result = _ocr_image(self.image)
             if result is None:
                 _tk_root.after(0, lambda: show_toast(
-                    "OCR unavailable", subtitle="No OCR engine found",
-                    accent=AMBER))
+                    "No numbers found", subtitle="Try a tighter snip",
+                    accent=AMBER, near_pos=near))
                 return
-            numbers, total, min_conf, currency = result
+            numbers, total, agreement, currency, rows = result
             _tk_root.after(0, lambda: _present_sum(
-                numbers, total, min_conf, currency))
+                numbers, total, agreement, currency, near, rows))
         threading.Thread(target=worker, daemon=True).start()
 
     def close(self):
@@ -846,4 +1071,6 @@ if __name__ == "__main__":
     threading.Thread(target=_run_tk, daemon=True).start()
     _tk_ready.wait()
     threading.Thread(target=_start_hotkey_listener, daemon=True).start()
+    # Warm up the OCR engine in the background so the first snip is fast
+    threading.Thread(target=_get_rapidocr, daemon=True).start()
     build_tray()
