@@ -19,9 +19,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install pillow pystray pywin32 pyinstaller keyboard pytesseract
+        run: pip install pillow pystray pywin32 pyinstaller keyboard pytesseract winsdk
 
-      - name: Install Tesseract OCR
+      - name: Install Tesseract OCR (fallback engine)
         run: choco install tesseract -y --no-progress
         shell: pwsh
 
@@ -54,6 +54,7 @@ jobs:
           pyinstaller --onefile --windowed --name DarcySnipTool --icon=darcysniptool.ico
           --upx-dir="${env:UPX_DIR}"
           --add-data "tesseract;tesseract"
+          --collect-all winsdk
           --exclude-module numpy
           --exclude-module matplotlib
           --exclude-module scipy
