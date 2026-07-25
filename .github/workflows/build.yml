@@ -18,14 +18,63 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
+        run: pip install pillow pystray pywin32 pyinstaller keyboard pytesseract
+
+      - name: Install Tesseract OCR
+        run: choco install tesseract -y --no-progress
+        shell: pwsh
+
+      - name: Locate and stage Tesseract for bundling
         run: |
-          pip install pillow pystray pywin32 pyinstaller numpy keyboard
+          $tessExe = (Get-Command tesseract -ErrorAction SilentlyContinue).Source
+          if (-not $tessExe) { $tessExe = "C:\Program Files\Tesseract-OCR\tesseract.exe" }
+          $tessDir = Split-Path $tessExe
+          echo "Tesseract dir: $tessDir"
+          New-Item -ItemType Directory -Force -Path tesseract | Out-Null
+          Copy-Item "$tessDir\*" -Destination tesseract -Recurse -Force
+          if (Test-Path "$tessDir\tessdata") {
+            Copy-Item "$tessDir\tessdata" -Destination tesseract -Recurse -Force
+          }
+          echo "Staged tesseract files:"
+          Get-ChildItem tesseract | Select-Object Name
+        shell: pwsh
+
+      - name: Download UPX
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip" -OutFile upx.zip
+          Expand-Archive -Path upx.zip -DestinationPath upx_extract
+          $upxPath = (Get-ChildItem -Path upx_extract -Recurse -Filter upx.exe | Select-Object -First 1).DirectoryName
+          echo "UPX_DIR=$upxPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+        shell: pwsh
 
       - name: Build EXE
+        run: >
+          python -c "from snip_tool import make_ico_file; make_ico_file()" ;
+          pyinstaller --onefile --windowed --name DarcySnipTool --icon=darcysniptool.ico
+          --upx-dir="${env:UPX_DIR}"
+          --add-data "tesseract;tesseract"
+          --exclude-module numpy
+          --exclude-module matplotlib
+          --exclude-module scipy
+          --exclude-module pandas
+          --exclude-module PIL.ImageQt
+          --exclude-module PIL.ImageFont
+          --exclude-module PIL.ImageCms
+          --exclude-module PIL.PdfParser
+          --exclude-module unittest
+          --exclude-module pydoc
+          --exclude-module doctest
+          --exclude-module pytest
+          --exclude-module test
+          --exclude-module sqlite3
+          snip_tool.py --clean --noconfirm
+        shell: pwsh
+
+      - name: Show final size
         run: |
-          python -c "from snip_tool import make_ico_file; make_ico_file()"
-          pyinstaller --onefile --windowed --name DarcySnipTool --icon=darcysniptool.ico snip_tool.py --clean --noconfirm
+          Get-ChildItem dist | Select-Object Name, @{Name="Size(MB)";Expression={[math]::Round($_.Length/1MB,2)}}
+        shell: pwsh
 
       - name: Upload EXE as artifact
         uses: actions/upload-artifact@v4
