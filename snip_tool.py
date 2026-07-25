@@ -4,7 +4,7 @@ Ctrl+Shift+S or click tray icon to snip.
 """
 
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
 import threading
 import os
 import io
@@ -34,6 +34,8 @@ ORANGE_DK = "#CC6600"
 GOLD      = "#FFD700"
 DARK_BG   = "#1e1e2e"
 BLUE      = "#7aa2f7"
+GREEN     = "#9ece6a"
+AMBER     = "#e0af68"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -315,6 +317,113 @@ def _fmt_num(n):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  TOAST NOTIFICATION  (lightweight, bottom-right, auto-dismiss)
+# ══════════════════════════════════════════════════════════════════════════
+_active_toasts = []
+
+def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=4200):
+    """Show a small notification in the bottom-right corner that fades away."""
+    try:
+        toast = tk.Toplevel(_tk_root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        toast.attributes("-alpha", 0.0)
+        toast.configure(bg=DARK_BG)
+
+        pad = 14
+        frame = tk.Frame(toast, bg=DARK_BG)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Accent stripe down the left
+        stripe = tk.Frame(frame, bg=accent, width=4)
+        stripe.pack(side=tk.LEFT, fill=tk.Y)
+
+        body = tk.Frame(frame, bg=DARK_BG)
+        body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, pad), pady=pad)
+
+        tk.Label(body, text=title, bg=DARK_BG, fg="white",
+                 font=("Segoe UI", 14, "bold"), anchor="w",
+                 justify="left").pack(anchor="w")
+
+        if subtitle:
+            tk.Label(body, text=subtitle, bg=DARK_BG, fg="#a9b1d6",
+                     font=("Segoe UI", 9), anchor="w",
+                     justify="left").pack(anchor="w", pady=(2, 0))
+
+        # Optional: small breakdown of the numbers found
+        if numbers:
+            preview = "  ".join(_fmt_num(n) for n in numbers)
+            if len(preview) > 60:
+                preview = preview[:57] + "…"
+            tk.Label(body, text=preview, bg=DARK_BG, fg="#6b7089",
+                     font=("Consolas", 8), anchor="w",
+                     justify="left").pack(anchor="w", pady=(4, 0))
+
+        # Size & position: bottom-right, stacked above existing toasts
+        toast.update_idletasks()
+        tw = toast.winfo_width()
+        th = toast.winfo_height()
+        sw = toast.winfo_screenwidth()
+        sh = toast.winfo_screenheight()
+        margin = 18
+        taskbar = 48
+        offset  = sum(t.winfo_height() + 10 for t in _active_toasts
+                      if t.winfo_exists())
+        x = sw - tw - margin
+        y = sh - th - taskbar - margin - offset
+        toast.geometry(f"+{x}+{y}")
+
+        _active_toasts.append(toast)
+
+        # Click to dismiss immediately
+        def dismiss(_=None):
+            _fade_out(toast)
+        for wdg in [frame, body, toast] + list(body.winfo_children()):
+            wdg.bind("<Button-1>", dismiss)
+
+        _fade_in(toast)
+        toast.after(duration, lambda: _fade_out(toast))
+    except Exception:
+        pass
+
+
+def _fade_in(win, alpha=0.0):
+    if not win.winfo_exists():
+        return
+    alpha = min(0.96, alpha + 0.12)
+    try:
+        win.attributes("-alpha", alpha)
+    except Exception:
+        return
+    if alpha < 0.96:
+        win.after(16, lambda: _fade_in(win, alpha))
+
+
+def _fade_out(win, alpha=None):
+    if not win.winfo_exists():
+        return
+    if alpha is None:
+        try:
+            alpha = float(win.attributes("-alpha"))
+        except Exception:
+            alpha = 0.96
+    alpha -= 0.10
+    if alpha <= 0:
+        if win in _active_toasts:
+            _active_toasts.remove(win)
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        return
+    try:
+        win.attributes("-alpha", alpha)
+    except Exception:
+        return
+    win.after(16, lambda: _fade_out(win, alpha))
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  FLOATING SNIP
 # ══════════════════════════════════════════════════════════════════════════
 class FloatingSnip:
@@ -403,36 +512,86 @@ class FloatingSnip:
         try:
             import pytesseract
         except Exception:
-            _tk_root.after(0, lambda: messagebox.showerror(
+            _tk_root.after(0, lambda: show_toast(
                 "OCR unavailable",
-                "The OCR engine isn't available in this build."))
+                subtitle="Engine not found in this build", accent=AMBER))
             return
 
         _configure_tesseract()
 
         try:
+            from PIL import ImageOps, ImageEnhance, ImageFilter
+
             img = self.image.convert("L")
+
+            # Upscale small snips for better accuracy
             w, h = img.size
-            if max(w, h) < 1000:
-                factor = max(2, 1000 // max(w, h))
+            if max(w, h) < 1400:
+                factor = max(3, 1400 // max(w, h))
                 img = img.resize((w*factor, h*factor), Image.LANCZOS)
-            text = pytesseract.image_to_string(img)
+
+            # Sharpen slightly, then normalise contrast
+            img = img.filter(ImageFilter.SHARPEN)
+            img = ImageOps.autocontrast(img, cutoff=2)
+            img = ImageEnhance.Contrast(img).enhance(1.5)
+
+            # Binarise: convert to pure black/white using a threshold.
+            # This strips highlight backgrounds and anti-aliasing noise.
+            # Threshold chosen from the mean so it adapts to light/dark themes.
+            hist_mean = int(sum(i*c for i, c in enumerate(img.histogram()))
+                            / max(1, sum(img.histogram())))
+            threshold = max(120, min(200, hist_mean))
+            bw = img.point(lambda p: 255 if p > threshold else 0)
+
+            # If the background came out dark (dark-mode snip), invert so
+            # Tesseract sees dark text on a light background.
+            if bw.histogram()[0] > bw.histogram()[255]:
+                bw = ImageOps.invert(bw)
+
+            # White border so no row sits flush against an edge
+            bw = ImageOps.expand(bw, border=40, fill=255)
+
+            # Restrict recognition to number-like characters only.
+            # This stops 0->O, 5->S, 1->l style misreads.
+            whitelist = "0123456789.,-()£$€%"
+            config = (f"--psm 6 -c tessedit_char_whitelist={whitelist}")
+
+            # Get per-word data so we can read confidence scores
+            data = pytesseract.image_to_data(
+                bw, config=config,
+                output_type=pytesseract.Output.DICT)
         except Exception as e:
-            msg = str(e)
-            _tk_root.after(0, lambda: messagebox.showerror(
-                "OCR error", f"Could not read the image.\n\n{msg}"))
+            _tk_root.after(0, lambda: show_toast(
+                "OCR error", subtitle="Could not read the image",
+                accent=AMBER))
             return
 
-        numbers, total = _extract_and_sum(text)
-        _tk_root.after(0, lambda: self._show_sum_result(numbers, total))
+        # Reconstruct text and track the lowest confidence among number words
+        words = []
+        confidences = []
+        for i, word in enumerate(data.get("text", [])):
+            word = word.strip()
+            if not word:
+                continue
+            try:
+                conf = float(data["conf"][i])
+            except (ValueError, KeyError, IndexError):
+                conf = -1
+            if any(ch.isdigit() for ch in word):
+                words.append(word)
+                if conf >= 0:
+                    confidences.append(conf)
 
-    def _show_sum_result(self, numbers, total):
+        text = "\n".join(words)
+        numbers, total = _extract_and_sum(text)
+        min_conf = min(confidences) if confidences else None
+        _tk_root.after(0, lambda: self._show_sum_result(numbers, total, min_conf))
+
+    def _show_sum_result(self, numbers, total, min_conf=None):
         if not numbers:
-            messagebox.showinfo(
-                "Sum numbers",
-                "No numbers were found in the selection.\n\n"
-                "Tip: snip tightly around just the figures and make sure "
-                "the text is reasonably sharp.")
+            # Lightweight: a quiet toast instead of a blocking popup
+            show_toast("No numbers found", subtitle="Try a tighter snip",
+                       accent=AMBER)
             return
 
         total_str = _fmt_num(total)
@@ -442,15 +601,17 @@ class FloatingSnip:
         except Exception:
             pass
 
-        listed = "\n".join(f"   {_fmt_num(n)}" for n in numbers)
-        count  = len(numbers)
-        messagebox.showinfo(
-            "Sum numbers",
-            f"Found {count} number{'s' if count != 1 else ''}:\n\n"
-            f"{listed}\n\n"
-            f"─────────────\n"
-            f"TOTAL:  {total_str}\n\n"
-            f"(The total has been copied to your clipboard.)")
+        count = len(numbers)
+        low   = (min_conf is not None and min_conf < 75)
+
+        title    = f"Total:  {total_str}"
+        subtitle = f"{count} number{'s' if count != 1 else ''} · copied to clipboard"
+        if low:
+            subtitle = f"{count} numbers · ⚠ low confidence, check figures"
+
+        show_toast(title, subtitle=subtitle,
+                   accent=(AMBER if low else GREEN),
+                   numbers=numbers)
 
     def close(self):
         if self in snip_windows: snip_windows.remove(self)
