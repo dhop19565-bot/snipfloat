@@ -4,7 +4,7 @@ Ctrl+Shift+S or click tray icon to snip.
 """
 
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import threading
 import os
 import io
@@ -233,6 +233,88 @@ def _open_overlay():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  OCR HELPERS  (used by "Sum numbers")
+# ══════════════════════════════════════════════════════════════════════════
+import re
+
+_tesseract_configured = False
+
+def _configure_tesseract():
+    """Point pytesseract at a bundled tesseract.exe if one is present."""
+    global _tesseract_configured
+    if _tesseract_configured:
+        return
+    try:
+        import pytesseract
+        import sys
+        # When frozen by PyInstaller, bundled files live in sys._MEIPASS
+        base = getattr(sys, "_MEIPASS",
+                       os.path.dirname(os.path.abspath(__file__)))
+        candidates = [
+            os.path.join(base, "tesseract", "tesseract.exe"),
+            os.path.join(base, "tesseract.exe"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "tesseract", "tesseract.exe"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                pytesseract.pytesseract.tesseract_cmd = c
+                tessdata = os.path.join(os.path.dirname(c), "tessdata")
+                if os.path.isdir(tessdata):
+                    os.environ["TESSDATA_PREFIX"] = tessdata
+                break
+    except Exception:
+        pass
+    _tesseract_configured = True
+
+
+def _extract_and_sum(text):
+    """
+    Pull numbers out of OCR text and sum them.
+    Handles: thousands separators (1,234.56), currency symbols (£$€),
+    percentages, negatives, and parentheses-as-negative accounting style.
+    Returns (list_of_numbers, total).
+    """
+    numbers = []
+    # Match number-like tokens, optionally wrapped in parentheses
+    #   e.g. 1,234.56  |  -12.5  |  (89.00)  |  $1,000  |  45%
+    token_re = re.compile(r'\(?-?[£$€]?\s?\d[\d,]*\.?\d*\s?%?\)?')
+
+    for raw in token_re.findall(text):
+        token = raw.strip()
+        if not any(ch.isdigit() for ch in token):
+            continue
+
+        negative = False
+        # Accounting-style parentheses = negative
+        if token.startswith("(") and token.endswith(")"):
+            negative = True
+        # Strip everything that isn't a digit, dot or minus
+        cleaned = token.replace("(", "").replace(")", "")
+        cleaned = cleaned.replace(",", "")       # thousands separators
+        cleaned = re.sub(r'[£$€%\s]', "", cleaned)
+        if cleaned.count("-") > 0 and not cleaned.startswith("-"):
+            cleaned = cleaned.replace("-", "")   # stray dash
+        try:
+            val = float(cleaned)
+        except ValueError:
+            continue
+        if negative:
+            val = -abs(val)
+        numbers.append(val)
+
+    total = sum(numbers)
+    return numbers, total
+
+
+def _fmt_num(n):
+    """Format a number cleanly: drop trailing .0, add thousands separators."""
+    if abs(n - round(n)) < 1e-9:
+        return f"{int(round(n)):,}"
+    return f"{n:,.2f}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  FLOATING SNIP
 # ══════════════════════════════════════════════════════════════════════════
 class FloatingSnip:
@@ -260,6 +342,7 @@ class FloatingSnip:
                             font=("Segoe UI",10), relief=tk.FLAT, bd=0)
         self.menu.add_command(label="📋  Copy",       command=self.copy)
         self.menu.add_command(label="💾  Save as...", command=self.save)
+        self.menu.add_command(label="🔢  Sum numbers (OCR)", command=self.sum_numbers)
         self.menu.add_separator()
         self.menu.add_command(label="✕  Close",       command=self.close)
 
@@ -312,6 +395,62 @@ class FloatingSnip:
             filetypes=[("PNG","*.png"),("JPEG","*.jpg"),("All","*.*")],
             title="Save snip")
         if p: self.image.save(p)
+
+    def sum_numbers(self):
+        threading.Thread(target=self._do_ocr_sum, daemon=True).start()
+
+    def _do_ocr_sum(self):
+        try:
+            import pytesseract
+        except Exception:
+            _tk_root.after(0, lambda: messagebox.showerror(
+                "OCR unavailable",
+                "The OCR engine isn't available in this build."))
+            return
+
+        _configure_tesseract()
+
+        try:
+            img = self.image.convert("L")
+            w, h = img.size
+            if max(w, h) < 1000:
+                factor = max(2, 1000 // max(w, h))
+                img = img.resize((w*factor, h*factor), Image.LANCZOS)
+            text = pytesseract.image_to_string(img)
+        except Exception as e:
+            msg = str(e)
+            _tk_root.after(0, lambda: messagebox.showerror(
+                "OCR error", f"Could not read the image.\n\n{msg}"))
+            return
+
+        numbers, total = _extract_and_sum(text)
+        _tk_root.after(0, lambda: self._show_sum_result(numbers, total))
+
+    def _show_sum_result(self, numbers, total):
+        if not numbers:
+            messagebox.showinfo(
+                "Sum numbers",
+                "No numbers were found in the selection.\n\n"
+                "Tip: snip tightly around just the figures and make sure "
+                "the text is reasonably sharp.")
+            return
+
+        total_str = _fmt_num(total)
+        try:
+            _tk_root.clipboard_clear()
+            _tk_root.clipboard_append(total_str)
+        except Exception:
+            pass
+
+        listed = "\n".join(f"   {_fmt_num(n)}" for n in numbers)
+        count  = len(numbers)
+        messagebox.showinfo(
+            "Sum numbers",
+            f"Found {count} number{'s' if count != 1 else ''}:\n\n"
+            f"{listed}\n\n"
+            f"─────────────\n"
+            f"TOTAL:  {total_str}\n\n"
+            f"(The total has been copied to your clipboard.)")
 
     def close(self):
         if self in snip_windows: snip_windows.remove(self)
