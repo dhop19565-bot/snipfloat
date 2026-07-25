@@ -58,16 +58,7 @@ jobs:
           --exclude-module matplotlib
           --exclude-module scipy
           --exclude-module pandas
-          --exclude-module PIL.ImageQt
-          --exclude-module PIL.ImageFont
-          --exclude-module PIL.ImageCms
-          --exclude-module PIL.PdfParser
-          --exclude-module unittest
-          --exclude-module pydoc
-          --exclude-module doctest
           --exclude-module pytest
-          --exclude-module test
-          --exclude-module sqlite3
           snip_tool.py --clean --noconfirm
         shell: pwsh
 
