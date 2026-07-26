@@ -674,11 +674,14 @@ def _find_subsets(values, target, max_items=4, max_results=6):
 
 
 def _detect_currency(text):
-    """Return the first currency symbol found in the OCR text, or GBP default."""
+    """
+    Return the currency symbol actually present in the OCR text.
+    No symbol in the snip -> no symbol in the output (figures shown bare).
+    """
     for sym in ("£", "$", "€"):
         if sym in text:
             return sym
-    return "£"   # default for this user's F&O entity (GBP)
+    return ""
 
 
 def _fmt_num(n, currency=""):
