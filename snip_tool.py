@@ -37,6 +37,12 @@ BLUE      = "#7aa2f7"
 GREEN     = "#9ece6a"
 AMBER     = "#e0af68"
 
+# Highlighter pen colours (RGB, used as a multiply tint)
+HL_YELLOW = (255, 245, 120)
+HL_GREEN  = (170, 255, 170)
+HL_PINK   = (255, 180, 210)
+HL_BLUE   = (170, 215, 255)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  ICON
@@ -264,6 +270,158 @@ def _get_rapidocr():
     except Exception:
         _rapid_engine = None
     return _rapid_engine
+
+
+def _rapidocr_items(pil_image):
+    """
+    Run RapidOCR and return [(text, x_left, x_right, x_centre, y_centre, h)]
+    so we can reconstruct table rows and columns.
+    """
+    try:
+        engine = _get_rapidocr()
+        if engine is None:
+            return None
+        import numpy as np
+        arr = np.array(pil_image.convert("RGB"))
+        result, _elapse = engine(arr)
+        if not result:
+            return None
+        items = []
+        for entry in result:
+            try:
+                box, txt = entry[0], entry[1]
+                xs = [p[0] for p in box]
+                ys = [p[1] for p in box]
+                items.append((str(txt), min(xs), max(xs),
+                              sum(xs)/len(xs), sum(ys)/len(ys),
+                              max(ys) - min(ys)))
+            except Exception:
+                continue
+        return items or None
+    except Exception:
+        return None
+
+
+def _column_bounds_from_whitespace(items, width, min_gutter=10):
+    """
+    Find column boundaries by locating vertical gutters — x ranges where no
+    text appears anywhere in the snip.
+    """
+    if not items or width <= 0:
+        return []
+    occupied = bytearray(width + 1)
+    for (_t, l, r, _cx, _cy, _h) in items:
+        a = max(0, int(l)); b = min(width, int(r))
+        for x in range(a, b + 1):
+            occupied[x] = 1
+
+    gutters, run_start = [], None
+    for x in range(width + 1):
+        if not occupied[x]:
+            if run_start is None:
+                run_start = x
+        else:
+            if run_start is not None:
+                if x - run_start >= min_gutter:
+                    gutters.append((run_start, x))
+                run_start = None
+    if run_start is not None and (width - run_start) >= min_gutter:
+        gutters.append((run_start, width))
+
+    edge = max(5, width // 100)
+    inner = [(a, b) for (a, b) in gutters if a > edge and b < width - edge]
+    return [(a + b) / 2.0 for (a, b) in inner]
+
+
+def _column_bounds_from_header(items, med_h):
+    """
+    Use the top row (usually column headers) to infer column boundaries.
+    Headers are short and well separated, so they reveal splits that long
+    data values would otherwise hide.
+    """
+    if not items:
+        return []
+    top_y = min(i[4] for i in items)
+    header = [i for i in items if abs(i[4] - top_y) <= max(4.0, med_h * 0.6)]
+    if len(header) < 2:
+        return []
+    header.sort(key=lambda i: i[1])
+    return [(a[2] + b[1]) / 2.0 for a, b in zip(header, header[1:])]
+
+
+def _merge_bounds(*lists, tol=15.0):
+    """Combine boundary lists, collapsing ones that sit close together."""
+    allb = sorted(b for lst in lists for b in lst)
+    out = []
+    for b in allb:
+        if not out or b - out[-1] > tol:
+            out.append(b)
+        else:
+            out[-1] = (out[-1] + b) / 2.0
+    return out
+
+
+def _extract_table(pil_image):
+    """
+    Reconstruct a table from the snip as rows of cells.
+    Returns a list of rows, each a list of cell strings, or None.
+    """
+    items = _rapidocr_items(pil_image)
+    if not items:
+        return None
+
+    width = pil_image.size[0]
+
+    # ── Rows: cluster by vertical centre, tolerance from text height ──────
+    heights = sorted(h for (_t, _l, _r, _cx, _cy, h) in items)
+    med_h = heights[len(heights) // 2] if heights else 12
+    row_tol = max(6.0, med_h * 0.6)
+
+    rows = []
+    for it in sorted(items, key=lambda i: i[4]):
+        placed = False
+        for r in rows:
+            if abs(it[4] - r["y"]) <= row_tol:
+                r["cells"].append(it)
+                r["y"] = (r["y"] * r["n"] + it[4]) / (r["n"] + 1)
+                r["n"] += 1
+                placed = True
+                break
+        if not placed:
+            rows.append({"y": it[4], "n": 1, "cells": [it]})
+    rows.sort(key=lambda r: r["y"])
+
+    # ── Columns: whitespace gutters + header-row gaps ────────────────────
+    # Whitespace finds obvious splits; the header row reveals splits that
+    # long data values (e.g. product names) would otherwise mask.
+    gutter = max(8, int(med_h * 0.7))
+    ws_bounds  = _column_bounds_from_whitespace(items, width, min_gutter=gutter)
+    hdr_bounds = _column_bounds_from_header(items, med_h)
+    bounds = _merge_bounds(ws_bounds, hdr_bounds, tol=max(10.0, med_h))
+
+    def col_index(cx):
+        i = 0
+        for b in bounds:
+            if cx > b:
+                i += 1
+        return i
+
+    ncols = len(bounds) + 1
+
+    grid = []
+    for r in rows:
+        cells = [""] * ncols
+        for it in sorted(r["cells"], key=lambda i: i[3]):
+            ci = min(col_index(it[3]), ncols - 1)
+            cells[ci] = (cells[ci] + " " + it[0]).strip() if cells[ci] else it[0]
+        grid.append(cells)
+
+    # Drop columns that are empty in every row
+    keep = [c for c in range(ncols) if any(row[c].strip() for row in grid)]
+    if keep and len(keep) < ncols:
+        grid = [[row[c] for c in keep] for row in grid]
+
+    return grid or None
 
 
 def _rapidocr_read(pil_image):
@@ -516,9 +674,9 @@ def _count_text_rows(pil_img):
                 in_band, start = True, y
             elif ink < thresh and in_band:
                 in_band = False
-                if y - start >= 3:
+                if y - start >= max(5, h // 60):
                     bands += 1
-        if in_band and h - start >= 3:
+        if in_band and h - start >= max(5, h // 60):
             bands += 1
         return bands
     except Exception:
@@ -560,6 +718,45 @@ def _ocr_variants(pil_image):
     except Exception:
         pass
     return out
+
+
+def _ocr_raw_text(pil_image):
+    """
+    Return all text found in the image (line structure preserved), or None.
+    Tries RapidOCR, then Windows OCR, then Tesseract.
+    """
+    # RapidOCR
+    try:
+        r = _rapidocr_read(pil_image)
+        if r and r[0] and r[0].strip():
+            return r[0]
+    except Exception:
+        pass
+    # Windows OCR
+    try:
+        t = _windows_ocr_text(pil_image.convert("RGB"))
+        if t and t.strip():
+            return t
+    except Exception:
+        pass
+    # Tesseract
+    try:
+        import pytesseract
+        _configure_tesseract()
+        from PIL import ImageOps
+        img = pil_image.convert("L")
+        w, h = img.size
+        if max(w, h) < 1400:
+            f = max(2, 1400 // max(w, h))
+            img = img.resize((w*f, h*f), Image.LANCZOS)
+        img = ImageOps.autocontrast(img, cutoff=1)
+        img = ImageOps.expand(img, border=40, fill=255)
+        t = pytesseract.image_to_string(img, config="--psm 6")
+        if t and t.strip():
+            return t
+    except Exception:
+        pass
+    return None
 
 
 # ── Shared OCR core: multi-pass with consensus voting ─────────────────────
@@ -716,12 +913,10 @@ def _present_sum(numbers, total, agreement, currency, near_pos=None, rows=0):
 
     count = len(numbers)
 
-    # Build any warnings
     warns = []
-    if rows and count < rows:
-        warns.append(f"⚠ only read {count} of {rows} rows")
-    elif rows and count > rows:
-        warns.append(f"⚠ read {count} values from {rows} rows")
+    # Allow a 1-row discrepancy (grid underlines can read as a row)
+    if rows and count < rows - 1:
+        warns.append(f"⚠ read {count} of ~{rows} rows")
     if agreement is not None and agreement < 0.75:
         warns.append("⚠ low confidence — check figures")
 
@@ -743,7 +938,7 @@ def _present_sum(numbers, total, agreement, currency, near_pos=None, rows=0):
                    numbers=numbers, currency=currency, near_pos=near_pos)
         return
 
-    # Normal one-shot sum
+    # Normal sum
     try:
         _tk_root.clipboard_clear()
         _tk_root.clipboard_append(_fmt_num(total).replace(",", ""))
@@ -764,7 +959,7 @@ def _present_sum(numbers, total, agreement, currency, near_pos=None, rows=0):
 # ══════════════════════════════════════════════════════════════════════════
 _active_toasts = []
 
-def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=4200,
+def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=6000,
                currency="", near_pos=None):
     """Show a small notification that fades away.
     If near_pos=(x, y) is given, appear next to that screen point (the snip);
@@ -796,14 +991,28 @@ def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=4200,
                      font=("Segoe UI", 9), anchor="w",
                      justify="left").pack(anchor="w", pady=(2, 0))
 
-        # Optional: small breakdown of the numbers found
+        # Breakdown of the figures found, wrapped over lines so you can
+        # check them against the source rather than truncated.
         if numbers:
-            preview = "  ".join(_fmt_num(n, currency) for n in numbers)
-            if len(preview) > 60:
-                preview = preview[:57] + "…"
-            tk.Label(body, text=preview, bg=DARK_BG, fg="#6b7089",
-                     font=("Consolas", 8), anchor="w",
-                     justify="left").pack(anchor="w", pady=(4, 0))
+            parts = [_fmt_num(n, currency) for n in numbers]
+            lines, cur_line = [], ""
+            for p in parts:
+                candidate = (cur_line + "   " + p).strip() if cur_line else p
+                if len(candidate) > 46:
+                    lines.append(cur_line)
+                    cur_line = p
+                else:
+                    cur_line = candidate
+            if cur_line:
+                lines.append(cur_line)
+            if len(lines) > 6:                      # keep the card sensible
+                shown = lines[:6]
+                remaining = len(parts) - sum(len(l.split()) for l in shown)
+                shown.append(f"… +{max(1, remaining)} more")
+                lines = shown
+            tk.Label(body, text="\n".join(lines), bg=DARK_BG, fg="#8b93b0",
+                     font=("Consolas", 9), anchor="w",
+                     justify="left").pack(anchor="w", pady=(6, 0))
 
         toast.update_idletasks()
         tw = toast.winfo_width()
@@ -838,14 +1047,46 @@ def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=4200,
 
         _active_toasts.append(toast)
 
+        # Auto-dismiss timer, pausable on hover
+        state = {"job": None, "hovering": False}
+
+        def schedule(delay=duration):
+            cancel()
+            state["job"] = toast.after(delay, lambda: _fade_out(toast))
+
+        def cancel():
+            if state["job"] is not None:
+                try:
+                    toast.after_cancel(state["job"])
+                except Exception:
+                    pass
+                state["job"] = None
+
+        def on_enter(_=None):
+            # Keep it up (and fully opaque) while the user is reading it
+            state["hovering"] = True
+            cancel()
+            try:
+                toast.attributes("-alpha", 0.99)
+            except Exception:
+                pass
+
+        def on_leave(_=None):
+            state["hovering"] = False
+            schedule(2500)          # short grace period after moving away
+
         # Click to dismiss immediately
         def dismiss(_=None):
+            cancel()
             _fade_out(toast)
+
         for wdg in [frame, body, toast] + list(body.winfo_children()):
             wdg.bind("<Button-1>", dismiss)
+            wdg.bind("<Enter>",    on_enter)
+            wdg.bind("<Leave>",    on_leave)
 
         _fade_in(toast)
-        toast.after(duration, lambda: _fade_out(toast))
+        schedule()
     except Exception:
         pass
 
@@ -899,6 +1140,17 @@ class FloatingSnip:
 
         w,h = image.size
 
+        # Pristine copy so highlights can be undone / cleared, and so OCR
+        # always reads the unmarked original.
+        self.original_image = image.copy()
+        self.highlights = []          # list of (x1,y1,x2,y2,(r,g,b))
+
+        # Highlighter state
+        self.hl_mode   = False
+        self.hl_colour = HL_YELLOW
+        self._hl_start = None
+        self._hl_rect  = None
+
         self.win.geometry(f"{w}x{h}+{x}+{y}")
 
         self.tk_img = ImageTk.PhotoImage(image)
@@ -906,17 +1158,10 @@ class FloatingSnip:
                             bd=0, highlightthickness=0, bg=DARK_BG,
                             cursor="fleur")
         self.cv.pack(fill=tk.BOTH, expand=True)
-        self.cv.create_image(0,0, anchor=tk.NW, image=self.tk_img)
+        self.cv_img_id = self.cv.create_image(0,0, anchor=tk.NW,
+                                              image=self.tk_img)
 
-        self.menu = tk.Menu(self.win, tearoff=0,
-                            bg="#2a2a3e", fg="white",
-                            activebackground=BLUE, activeforeground="white",
-                            font=("Segoe UI",10), relief=tk.FLAT, bd=0)
-        self.menu.add_command(label="📋  Copy",       command=self.copy)
-        self.menu.add_command(label="💾  Save as...", command=self.save)
-        self.menu.add_command(label="🔢  Sum numbers (OCR)", command=self.sum_numbers)
-        self.menu.add_separator()
-        self.menu.add_command(label="✕  Close",       command=self.close)
+        self._build_menu()
 
         self._dx = self._dy = 0
         self._moved = False
@@ -924,21 +1169,132 @@ class FloatingSnip:
         self.cv.bind("<B1-Motion>",       self._dm)
         self.cv.bind("<ButtonRelease-1>", self._click_dismiss)
         self.cv.bind("<ButtonPress-3>",   self._show_menu)
+        self.win.bind("<Escape>",         lambda e: self._set_hl_mode(False))
 
         self.win.lift()
         snip_windows.append(self)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
+    # ── Menu ──────────────────────────────────────────────────────────
+    def _build_menu(self):
+        self.menu = tk.Menu(self.win, tearoff=0,
+                            bg="#2a2a3e", fg="white",
+                            activebackground=BLUE, activeforeground="white",
+                            font=("Segoe UI",10), relief=tk.FLAT, bd=0)
+        self.menu.add_command(label="📋  Copy",       command=self.copy)
+        self.menu.add_command(label="💾  Save as...", command=self.save)
+        self.menu.add_command(label="🔢  Sum numbers (OCR)",
+                              command=self.sum_numbers)
+        self.menu.add_command(label="📊  Copy figures as column",
+                              command=self.copy_figures_column)
+        self.menu.add_command(label="📄  Copy all text",
+                              command=self.copy_all_text)
+        self.menu.add_command(label="🗂  Copy as table (for Excel)",
+                              command=self.copy_as_table)
+        self.menu.add_separator()
+
+        label = "🖍  Highlighter: ON" if self.hl_mode else "🖍  Highlighter"
+        self.menu.add_command(label=label, command=self._toggle_hl)
+
+        colours = tk.Menu(self.menu, tearoff=0, bg="#2a2a3e", fg="white",
+                          activebackground=BLUE, activeforeground="white",
+                          font=("Segoe UI",10), relief=tk.FLAT, bd=0)
+        for name, rgb in (("Yellow", HL_YELLOW), ("Green", HL_GREEN),
+                          ("Pink", HL_PINK), ("Blue", HL_BLUE)):
+            mark = " ✓" if rgb == self.hl_colour else ""
+            colours.add_command(label=name + mark,
+                                command=lambda c=rgb: self._set_colour(c))
+        self.menu.add_cascade(label="🎨  Highlight colour", menu=colours)
+
+        if self.highlights:
+            self.menu.add_command(label="↩  Undo highlight",
+                                  command=self._undo_highlight)
+            self.menu.add_command(label="🧹  Clear highlights",
+                                  command=self._clear_highlights)
+        self.menu.add_separator()
+        self.menu.add_command(label="✕  Close", command=self.close)
+
+    # ── Highlighter ───────────────────────────────────────────────────
+    def _toggle_hl(self):
+        self._set_hl_mode(not self.hl_mode)
+
+    def _set_hl_mode(self, on):
+        self.hl_mode = bool(on)
+        self.cv.config(cursor="pencil" if self.hl_mode else "fleur")
+        self._build_menu()
+
+    def _set_colour(self, rgb):
+        self.hl_colour = rgb
+        if not self.hl_mode:
+            self._set_hl_mode(True)
+        else:
+            self._build_menu()
+
+    def _apply_highlights(self):
+        """Rebuild the working image from the original plus all highlights."""
+        from PIL import ImageDraw, ImageChops
+        base = self.original_image.convert("RGB")
+        if self.highlights:
+            tint = Image.new("RGB", base.size, (255, 255, 255))
+            td = ImageDraw.Draw(tint)
+            for (x1, y1, x2, y2, rgb) in self.highlights:
+                td.rectangle([x1, y1, x2, y2], fill=rgb)
+            # Multiply blend = authentic highlighter: text stays dark,
+            # background takes the colour.
+            base = ImageChops.multiply(base, tint)
+        self.image = base
+        self.tk_img = ImageTk.PhotoImage(self.image)
+        self.cv.itemconfigure(self.cv_img_id, image=self.tk_img)
+
+    def _undo_highlight(self):
+        if self.highlights:
+            self.highlights.pop()
+            self._apply_highlights()
+            self._build_menu()
+
+    def _clear_highlights(self):
+        self.highlights = []
+        self._apply_highlights()
+        self._build_menu()
+
+    # ── Mouse ─────────────────────────────────────────────────────────
     def _ds(self, e):
+        if self.hl_mode:
+            self._hl_start = (e.x, e.y)
+            r, g, b = self.hl_colour
+            self._hl_rect = self.cv.create_rectangle(
+                e.x, e.y, e.x, e.y,
+                outline=f"#{r:02x}{g:02x}{b:02x}", width=1,
+                fill=f"#{r:02x}{g:02x}{b:02x}", stipple="gray50")
+            return
         self._dx = e.x_root - self.win.winfo_x()
         self._dy = e.y_root - self.win.winfo_y()
         self._moved = False
 
     def _dm(self, e):
+        if self.hl_mode:
+            if self._hl_rect is not None and self._hl_start:
+                x0, y0 = self._hl_start
+                self.cv.coords(self._hl_rect, x0, y0, e.x, e.y)
+            return
         self._moved = True
         self.win.geometry(f"+{e.x_root-self._dx}+{e.y_root-self._dy}")
 
     def _click_dismiss(self, e):
+        if self.hl_mode:
+            # Commit the highlight stroke into the image
+            if self._hl_rect is not None and self._hl_start:
+                x0, y0 = self._hl_start
+                x1, y1 = min(x0, e.x), min(y0, e.y)
+                x2, y2 = max(x0, e.x), max(y0, e.y)
+                self.cv.delete(self._hl_rect)
+                self._hl_rect = None
+                self._hl_start = None
+                if (x2 - x1) > 3 and (y2 - y1) > 3:
+                    self.highlights.append((x1, y1, x2, y2, self.hl_colour))
+                    self._apply_highlights()
+                    self._build_menu()
+            return
         if not self._moved:
             self.close()
         self._moved = False
@@ -968,6 +1324,105 @@ class FloatingSnip:
             title="Save snip")
         if p: self.image.save(p)
 
+    def copy_figures_column(self):
+        """Copy the figures one-per-line so they paste into Excel as a column."""
+        near = self._toast_anchor()
+        def worker():
+            result = _ocr_image(self.original_image)
+            if result is None:
+                _tk_root.after(0, lambda: show_toast(
+                    "No numbers found", subtitle="Try a tighter snip",
+                    accent=AMBER, near_pos=near))
+                return
+            numbers, total, _conf, currency, _rows = result
+            if not numbers:
+                _tk_root.after(0, lambda: show_toast(
+                    "No numbers found", subtitle="Try a tighter snip",
+                    accent=AMBER, near_pos=near))
+                return
+            # Bare values, no separators/symbols, so Excel parses them as numbers
+            payload = "\n".join(
+                (f"{n:.2f}".rstrip("0").rstrip(".") if n % 1 else f"{int(n)}")
+                for n in numbers)
+            def finish():
+                try:
+                    _tk_root.clipboard_clear()
+                    _tk_root.clipboard_append(payload)
+                except Exception:
+                    pass
+                show_toast(f"{len(numbers)} figures copied",
+                           subtitle=f"Paste as a column  ·  total "
+                                    f"{_fmt_num(total, currency)}",
+                           accent=GREEN, numbers=numbers,
+                           currency=currency, near_pos=near)
+            _tk_root.after(0, finish)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def copy_as_table(self):
+        """Copy the snip as tab-separated rows/columns — pastes into Excel."""
+        near = self._toast_anchor()
+        def worker():
+            grid = _extract_table(self.original_image)
+            if not grid:
+                _tk_root.after(0, lambda: show_toast(
+                    "No table found", subtitle="Try a tighter snip",
+                    accent=AMBER, near_pos=near))
+                return
+            # Sanitise: a stray tab/newline inside a cell would shift the
+            # whole row when Excel parses it, so collapse them to spaces.
+            def clean(c):
+                return " ".join(str(c).replace("\t", " ")
+                                       .replace("\r", " ")
+                                       .replace("\n", " ").split())
+            ncols = max(len(r) for r in grid)
+            # Pad every row to the same width so columns stay aligned
+            rows = [[clean(c) for c in r] + [""] * (ncols - len(r))
+                    for r in grid]
+            tsv = "\n".join("\t".join(r) for r in rows)
+            def finish():
+                try:
+                    _tk_root.clipboard_clear()
+                    _tk_root.clipboard_append(tsv)
+                except Exception:
+                    pass
+                show_toast(
+                    f"Table copied  ·  {len(grid)} × {ncols}",
+                    subtitle="Paste into Excel to fill rows and columns",
+                    accent=GREEN, near_pos=near)
+            _tk_root.after(0, finish)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def copy_all_text(self):
+        """Copy every line of text in the snip (codes, descriptions, refs)."""
+        near = self._toast_anchor()
+        def worker():
+            text = _ocr_raw_text(self.original_image)
+            if not text or not text.strip():
+                _tk_root.after(0, lambda: show_toast(
+                    "No text found", subtitle="Try a tighter snip",
+                    accent=AMBER, near_pos=near))
+                return
+            lines = [l for l in (ln.strip() for ln in text.splitlines()) if l]
+            payload = "\n".join(lines)
+            def finish():
+                try:
+                    _tk_root.clipboard_clear()
+                    _tk_root.clipboard_append(payload)
+                except Exception:
+                    pass
+                preview = lines[0][:34] + ("…" if len(lines[0]) > 34 else "")
+                show_toast(f"{len(lines)} line{'s' if len(lines)!=1 else ''} copied",
+                           subtitle=preview, accent=GREEN, near_pos=near)
+            _tk_root.after(0, finish)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _toast_anchor(self):
+        try:
+            return (self.win.winfo_x() + self.win.winfo_width(),
+                    self.win.winfo_y())
+        except Exception:
+            return None
+
     def sum_numbers(self):
         # Anchor the result toast to the top-right of this snip window
         try:
@@ -976,7 +1431,7 @@ class FloatingSnip:
         except Exception:
             near = None
         def worker():
-            result = _ocr_image(self.image)
+            result = _ocr_image(self.original_image)
             if result is None:
                 _tk_root.after(0, lambda: show_toast(
                     "No numbers found", subtitle="Try a tighter snip",
