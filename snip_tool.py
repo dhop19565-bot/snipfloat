@@ -261,9 +261,9 @@ def _deprioritise_thread():
     return
 
 
-def _prepare_for_ocr(pil_image, max_edge=1600):
+def _prepare_for_ocr(pil_image, max_edge=1200):
     """
-    Cap the long edge before OCR. Beyond ~1600px the detector gains nothing
+    Cap the long edge before OCR. Beyond ~1200px the detector gains nothing
     but costs real time, and RapidOCR rescales internally anyway.
     Returns (image, scale_applied).
     """
@@ -1831,6 +1831,12 @@ if __name__ == "__main__":
     threading.Thread(target=_run_tk, daemon=True).start()
     _tk_ready.wait()
     threading.Thread(target=_start_hotkey_listener, daemon=True).start()
-    # Warm up the OCR engine in the background so the first snip is fast
-    threading.Thread(target=_get_rapidocr, daemon=True).start()
+
+    # Warm the OCR models AFTER the tray is up. Loading them takes a couple
+    # of seconds and CPU; doing it immediately made startup feel sluggish.
+    def _delayed_warmup():
+        time.sleep(6)
+        _get_rapidocr()
+    threading.Thread(target=_delayed_warmup, daemon=True).start()
+
     build_tray()
