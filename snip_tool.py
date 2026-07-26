@@ -1,6 +1,6 @@
 """
 DarcySnipTool - System tray snipping tool for Windows
-Ctrl+Shift+S or click tray icon to snip.
+Ctrl+Alt+S to snip, Ctrl+Shift+X to snip & sum, or use the tray icon.
 """
 
 import tkinter as tk
@@ -29,6 +29,13 @@ tray_icon     = None
 _tk_root      = None
 _tk_ready     = threading.Event()
 _snip_active  = False
+
+# ── HOTKEYS ───────────────────────────────────────────────────────────────
+# Change these if they clash with something else on your machine.
+# Avoid "win+shift+s" (Windows Snipping Tool) and "ctrl+shift+s" (Save As
+# in many apps). Other safe options: "ctrl+alt+d", "alt+s", "ctrl+alt+1".
+HOTKEY_SNIP = "ctrl+alt+s"     # snip -> floating window
+HOTKEY_SUM  = "ctrl+shift+x"     # snip -> sum instantly
 
 ORANGE    = "#FF8C00"
 ORANGE_DK = "#CC6600"
@@ -1755,9 +1762,22 @@ def _start_hotkey_listener():
             pass
         try:
             import keyboard
-            keyboard.add_hotkey("ctrl+shift+s", take_snip)
-            keyboard.add_hotkey("ctrl+shift+x", sum_snip)
-            _hotkeys_ok = True
+            failed = []
+            for combo, fn in ((HOTKEY_SNIP, take_snip), (HOTKEY_SUM, sum_snip)):
+                try:
+                    keyboard.add_hotkey(combo, fn)
+                except Exception:
+                    failed.append(combo)      # one clash mustn't kill the other
+            _hotkeys_ok = len(failed) < 2
+            if failed and _tk_root is not None:
+                names = ", ".join(c.replace("+", "+").upper() for c in failed)
+                try:
+                    _tk_root.after(0, lambda: show_toast(
+                        "Shortcut in use",
+                        subtitle=f"{names} is taken by another app",
+                        accent=AMBER))
+                except Exception:
+                    pass
             keyboard.wait()          # blocks this thread while hooks are live
             return
         except ImportError:
@@ -1787,6 +1807,12 @@ def quit_app(icon, _=None):
     icon.stop()
     os._exit(0)
 
+def _pretty_key(combo):
+    """'ctrl+alt+s' -> 'Ctrl+Alt+S' for menu labels."""
+    return "+".join(p.capitalize() if len(p) > 1 else p.upper()
+                    for p in combo.split("+"))
+
+
 def show_engine_status(icon=None, item=None):
     """Report which OCR engine is active — a silent fallback is ~6x slower."""
     eng = _get_rapidocr()
@@ -1807,9 +1833,9 @@ def show_engine_status(icon=None, item=None):
 def build_tray():
     global tray_icon
     menu = pystray.Menu(
-        item("✂  Take Snip  (Ctrl+Shift+S)",
+        item(f"✂  Take Snip  ({_pretty_key(HOTKEY_SNIP)})",
              lambda i, _: take_snip(), default=True),
-        item("🔢  Snip & Sum  (Ctrl+Shift+X)",
+        item(f"🔢  Snip & Sum  ({_pretty_key(HOTKEY_SUM)})",
              lambda i, _: sum_snip()),
         pystray.Menu.SEPARATOR,
         item("➕  Running tally",
