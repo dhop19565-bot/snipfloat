@@ -254,17 +254,11 @@ import re
 
 def _deprioritise_thread():
     """
-    Drop the calling thread to below-normal priority.
-    OCR is CPU-heavy; without this it competes with the UI and the global
-    hotkey hook, which makes the whole tool feel sluggish.
+    Nudge the OCR thread just below the UI without crippling it.
+    Capping ONNX threads already frees cores; dropping priority as well
+    made OCR far too slow, so this is now a no-op kept for compatibility.
     """
-    try:
-        THREAD_PRIORITY_BELOW_NORMAL = -1
-        h = ctypes.windll.kernel32.GetCurrentThread()
-        ctypes.windll.kernel32.SetThreadPriority(
-            h, THREAD_PRIORITY_BELOW_NORMAL)
-    except Exception:
-        pass
+    return
 
 
 def _prepare_for_ocr(pil_image, max_edge=1600):
@@ -288,6 +282,7 @@ def _prepare_for_ocr(pil_image, max_edge=1600):
 # ── RapidOCR (neural OCR, runs fully offline) — PRIMARY ENGINE ────────────
 _rapid_engine = None
 _rapid_checked = False
+_last_engine = ""
 
 def _get_rapidocr():
     """
@@ -306,8 +301,10 @@ def _get_rapidocr():
             from rapidocr_onnxruntime import RapidOCR
         except ImportError:
             from rapidocr import RapidOCR
+        # Leave ~1 core free for the UI and hotkey hook; don't halve the
+        # machine (that made OCR needlessly slow).
         cores = os.cpu_count() or 2
-        threads = max(1, min(4, cores // 2))
+        threads = max(2, cores - 1) if cores > 2 else max(1, cores)
         try:
             _rapid_engine = RapidOCR(intra_op_num_threads=threads,
                                      inter_op_num_threads=1)
@@ -779,78 +776,30 @@ def _count_text_rows(pil_img):
 
 # ── Preprocessing variants for multi-pass OCR ─────────────────────────────
 def _ocr_variants(pil_image):
-    """Yield several differently-processed versions of the snip."""
-    from PIL import ImageOps, ImageFilter, ImageEnhance
+    """
+    Yield a SMALL set of differently-processed versions for the fallback
+    engines. This used to return 9 variants which, across two engines and
+    two configs, meant ~27 OCR passes (~12s). Two variants is plenty.
+    """
+    from PIL import ImageOps, ImageFilter
     out = []
     try:
         base = pil_image.convert("L")
         w, h = base.size
         hist = base.histogram()
-        dark_bg = sum(hist[:128]) > sum(hist[128:])
-        if dark_bg:
+        if sum(hist[:128]) > sum(hist[128:]):      # dark mode
             base = ImageOps.invert(base)
 
-        target = 1600
-        scales = []
-        for s in (3, 4, 5):
-            if max(w, h) * s <= 6000:
-                scales.append(s)
-        if not scales:
-            scales = [2]
+        s = 3 if max(w, h) < 700 else 2
+        im = base.resize((w*s, h*s), Image.LANCZOS).filter(ImageFilter.SHARPEN)
+        ac = ImageOps.autocontrast(im, cutoff=1)
 
-        for s in scales:
-            im = base.resize((w*s, h*s), Image.LANCZOS).filter(ImageFilter.SHARPEN)
-            ac = ImageOps.autocontrast(im, cutoff=1)
-            # A: normalised contrast
-            out.append(ImageOps.expand(ac, border=60, fill=255))
-            # B: hard binarised
-            out.append(ImageOps.expand(
-                ac.point(lambda p: 255 if p > 160 else 0), border=60, fill=255))
-            # C: strong contrast boost
-            out.append(ImageOps.expand(
-                ImageEnhance.Contrast(ac).enhance(2.0), border=60, fill=255))
+        out.append(ImageOps.expand(ac, border=40, fill=255))          # normalised
+        out.append(ImageOps.expand(                                   # binarised
+            ac.point(lambda p: 255 if p > 160 else 0), border=40, fill=255))
     except Exception:
         pass
     return out
-
-
-def _ocr_raw_text(pil_image):
-    """
-    Return all text found in the image (line structure preserved), or None.
-    Tries RapidOCR, then Windows OCR, then Tesseract.
-    """
-    # RapidOCR
-    try:
-        r = _rapidocr_read(pil_image)
-        if r and r[0] and r[0].strip():
-            return r[0]
-    except Exception:
-        pass
-    # Windows OCR
-    try:
-        t = _windows_ocr_text(pil_image.convert("RGB"))
-        if t and t.strip():
-            return t
-    except Exception:
-        pass
-    # Tesseract
-    try:
-        import pytesseract
-        _configure_tesseract()
-        from PIL import ImageOps
-        img = pil_image.convert("L")
-        w, h = img.size
-        if max(w, h) < 1400:
-            f = max(2, 1400 // max(w, h))
-            img = img.resize((w*f, h*f), Image.LANCZOS)
-        img = ImageOps.autocontrast(img, cutoff=1)
-        img = ImageOps.expand(img, border=40, fill=255)
-        t = pytesseract.image_to_string(img, config="--psm 6")
-        if t and t.strip():
-            return t
-    except Exception:
-        pass
-    return None
 
 
 # ── Shared OCR core: multi-pass with consensus voting ─────────────────────
@@ -893,6 +842,7 @@ def _ocr_image(pil_image):
         if rnums:
             # If it found at least as many values as there are rows, trust it.
             if not expected_rows or len(rnums) >= expected_rows:
+                globals()["_last_engine"] = "RapidOCR"
                 return (rnums, rtotal,
                         (rconf if rconf is not None else 1.0),
                         _detect_currency(rtext), expected_rows)
@@ -906,10 +856,12 @@ def _ocr_image(pil_image):
                     t2, c2 = r2
                     n2, tot2 = _extract_and_sum(t2)
                     if n2 and len(n2) >= len(rnums):
+                        globals()["_last_engine"] = "RapidOCR"
                         return (n2, tot2, (c2 if c2 is not None else 1.0),
                                 _detect_currency(t2), expected_rows)
             except Exception:
                 pass
+            globals()["_last_engine"] = "RapidOCR"
             return (rnums, rtotal,
                     (rconf if rconf is not None else 1.0),
                     _detect_currency(rtext), expected_rows)
@@ -981,6 +933,7 @@ def _ocr_image(pil_image):
             break
     currency = _detect_currency(text_for_cur)
 
+    globals()["_last_engine"] = "fallback"
     return numbers, total, agreement, currency, expected_rows
 
 
@@ -1015,6 +968,8 @@ def _present_sum(numbers, total, agreement, currency, near_pos=None, rows=0):
     count = len(numbers)
 
     warns = []
+    if _last_engine == "fallback":
+        warns.append("⚠ slow fallback engine — RapidOCR not loaded")
     # Allow a 1-row discrepancy (grid underlines can read as a row)
     if rows and count < rows - 1:
         warns.append(f"⚠ read {count} of ~{rows} rows")
@@ -1820,6 +1775,23 @@ def quit_app(icon, _=None):
     icon.stop()
     os._exit(0)
 
+def show_engine_status(icon=None, item=None):
+    """Report which OCR engine is active — a silent fallback is ~6x slower."""
+    eng = _get_rapidocr()
+    if eng is not None:
+        cores = os.cpu_count() or 2
+        threads = max(2, cores - 1) if cores > 2 else max(1, cores)
+        _tk_root.after(0, lambda: show_toast(
+            "OCR engine: RapidOCR",
+            subtitle=f"neural, offline · {threads} of {cores} cores",
+            accent=GREEN))
+    else:
+        _tk_root.after(0, lambda: show_toast(
+            "OCR engine: fallback",
+            subtitle="RapidOCR failed to load — sums will be slow",
+            accent=AMBER))
+
+
 def build_tray():
     global tray_icon
     menu = pystray.Menu(
@@ -1831,6 +1803,8 @@ def build_tray():
         item("➕  Running tally",
              toggle_tally, checked=lambda i: _tally_enabled),
         item("♻  Reset tally", reset_tally),
+        pystray.Menu.SEPARATOR,
+        item("🔧  OCR engine…", show_engine_status),
         pystray.Menu.SEPARATOR,
         item("🗑  Close All Snips",
              lambda i, _: _tk_root.after(0, close_all_snips)),
