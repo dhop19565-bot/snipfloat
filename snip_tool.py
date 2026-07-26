@@ -627,6 +627,52 @@ def _extract_and_sum(text):
     return numbers, total
 
 
+def _find_subsets(values, target, max_items=4, max_results=6):
+    """
+    Find combinations of `values` that sum to `target`.
+    Works in whole pennies so floating-point drift can't cause a near-miss.
+    Searches smallest-first and stops at the first size that produces hits,
+    so the simplest explanation wins.
+    Returns (exact_matches, closest_or_None).
+    """
+    from itertools import combinations
+
+    vals = [(int(round(v * 100)), v) for v in values if abs(v) > 0.004]
+    if not vals:
+        return [], None
+    tgt = int(round(target * 100))
+
+    # Keep the search bounded on long lists
+    n = len(vals)
+    if n > 80:
+        max_items = min(max_items, 2)
+    elif n > 45:
+        max_items = min(max_items, 3)
+    max_items = max(1, min(max_items, n))
+
+    exact = []
+    best = None                      # (distance_in_pennies, combo)
+
+    for size in range(1, max_items + 1):
+        for combo in combinations(vals, size):
+            s = 0
+            for c in combo:
+                s += c[0]
+            d = s - tgt
+            if d == 0:
+                exact.append([c[1] for c in combo])
+                if len(exact) >= max_results:
+                    return exact, None
+            else:
+                ad = -d if d < 0 else d
+                if best is None or ad < best[0]:
+                    best = (ad, [c[1] for c in combo])
+        if exact:
+            return exact, None
+
+    return exact, best
+
+
 def _detect_currency(text):
     """Return the first currency symbol found in the OCR text, or GBP default."""
     for sym in ("£", "$", "€"):
@@ -955,6 +1001,84 @@ def _present_sum(numbers, total, agreement, currency, near_pos=None, rows=0):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  SMALL THEMED INPUT DIALOG
+# ══════════════════════════════════════════════════════════════════════════
+def ask_amount(prompt="Difference to find", near_pos=None, prefill=""):
+    """Modal mini-dialog matching the tool's theme. Returns float or None."""
+    result = {"value": None}
+
+    dlg = tk.Toplevel(_tk_root)
+    dlg.overrideredirect(True)
+    dlg.attributes("-topmost", True)
+    dlg.configure(bg=DARK_BG)
+
+    frame = tk.Frame(dlg, bg=DARK_BG, highlightthickness=1,
+                     highlightbackground=BLUE)
+    frame.pack(fill=tk.BOTH, expand=True)
+
+    tk.Label(frame, text=prompt, bg=DARK_BG, fg="white",
+             font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=16, pady=(14, 2))
+    tk.Label(frame, text="Enter the amount you're trying to explain",
+             bg=DARK_BG, fg="#a9b1d6",
+             font=("Segoe UI", 9)).pack(anchor="w", padx=16)
+
+    var = tk.StringVar(value=prefill)
+    entry = tk.Entry(frame, textvariable=var, bg="#2a2a3e", fg="white",
+                     insertbackground="white", relief=tk.FLAT,
+                     font=("Consolas", 13), width=18)
+    entry.pack(padx=16, pady=(10, 4), ipady=5)
+
+    btns = tk.Frame(frame, bg=DARK_BG)
+    btns.pack(fill=tk.X, padx=16, pady=(6, 14))
+
+    def ok(_=None):
+        raw = var.get().strip()
+        raw = re.sub(r"[£$€,\s]", "", raw)
+        neg = raw.startswith("(") and raw.endswith(")")
+        raw = raw.strip("()")
+        try:
+            v = float(raw)
+            result["value"] = -abs(v) if neg else v
+        except ValueError:
+            result["value"] = None
+        dlg.destroy()
+
+    def cancel(_=None):
+        result["value"] = None
+        dlg.destroy()
+
+    tk.Button(btns, text="Find", command=ok, bg=BLUE, fg="white",
+              relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
+              padx=14, pady=3, activebackground="#5c86e6",
+              activeforeground="white").pack(side=tk.RIGHT)
+    tk.Button(btns, text="Cancel", command=cancel, bg="#2a2a3e", fg="#a9b1d6",
+              relief=tk.FLAT, font=("Segoe UI", 9),
+              padx=12, pady=3, activebackground="#3a3a4e",
+              activeforeground="white").pack(side=tk.RIGHT, padx=(0, 8))
+
+    dlg.bind("<Return>", ok)
+    dlg.bind("<Escape>", cancel)
+
+    dlg.update_idletasks()
+    w, h = dlg.winfo_width(), dlg.winfo_height()
+    sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+    if near_pos:
+        x, y = near_pos[0] + 12, near_pos[1]
+        if x + w + 20 > sw: x = near_pos[0] - w - 12
+        if y + h + 20 > sh: y = sh - h - 20
+        x, y = max(10, x), max(10, y)
+    else:
+        x, y = (sw - w) // 2, (sh - h) // 3
+    dlg.geometry(f"+{int(x)}+{int(y)}")
+
+    entry.focus_force()
+    entry.select_range(0, tk.END)
+    dlg.grab_set()
+    dlg.wait_window()
+    return result["value"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  TOAST NOTIFICATION  (lightweight, bottom-right, auto-dismiss)
 # ══════════════════════════════════════════════════════════════════════════
 _active_toasts = []
@@ -1191,6 +1315,8 @@ class FloatingSnip:
                               command=self.copy_all_text)
         self.menu.add_command(label="🗂  Copy as table (for Excel)",
                               command=self.copy_as_table)
+        self.menu.add_command(label="🔍  Find difference…",
+                              command=self.find_difference)
         self.menu.add_separator()
 
         label = "🖍  Highlighter: ON" if self.hl_mode else "🖍  Highlighter"
@@ -1357,6 +1483,88 @@ class FloatingSnip:
                            currency=currency, near_pos=near)
             _tk_root.after(0, finish)
         threading.Thread(target=worker, daemon=True).start()
+
+    def find_difference(self):
+        """Find which of the snipped figures add up to a target amount."""
+        near = self._toast_anchor()
+
+        # Pre-fill from the clipboard if it already holds a number
+        prefill = ""
+        try:
+            clip = _tk_root.clipboard_get()
+            if clip and re.fullmatch(r"[-+(]?[£$€]?[\d,]+\.?\d*\)?", clip.strip()):
+                prefill = clip.strip()
+        except Exception:
+            pass
+
+        target = ask_amount("Find difference", near_pos=near, prefill=prefill)
+        if target is None:
+            return
+
+        def worker():
+            result = _ocr_image(self.original_image)
+            if result is None:
+                _tk_root.after(0, lambda: show_toast(
+                    "No figures found", subtitle="Try a tighter snip",
+                    accent=AMBER, near_pos=near))
+                return
+            numbers, _total, _conf, currency, _rows = result
+            if not numbers:
+                _tk_root.after(0, lambda: show_toast(
+                    "No figures found", subtitle="Try a tighter snip",
+                    accent=AMBER, near_pos=near))
+                return
+
+            exact, closest = _find_subsets(numbers, target)
+            # If nothing matches, the sign may be the other way round
+            if not exact:
+                exact2, closest2 = _find_subsets(numbers, -target)
+                if exact2:
+                    exact = exact2
+                elif closest2 and (closest is None or closest2[0] < closest[0]):
+                    closest = closest2
+
+            _tk_root.after(0, lambda: self._show_difference(
+                exact, closest, target, currency, near, len(numbers)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_difference(self, exact, closest, target, currency, near, pool):
+        if exact:
+            first = sorted(exact[0], key=lambda v: -abs(v))
+            parts = "  +  ".join(_fmt_num(v, currency) for v in first)
+            sub = f"{len(first)} of {pool} figures"
+            if len(exact) > 1:
+                sub += f"  ·  ⚠ {len(exact)} possible combinations"
+            # Copy the matching figures so they can be pasted / ticked off
+            try:
+                _tk_root.clipboard_clear()
+                _tk_root.clipboard_append(
+                    "\n".join(f"{v:.2f}".rstrip("0").rstrip(".")
+                               if v % 1 else f"{int(v)}" for v in first))
+            except Exception:
+                pass
+            show_toast(parts,
+                       subtitle=f"= {_fmt_num(target, currency)}  ·  {sub}",
+                       accent=(AMBER if len(exact) > 1 else GREEN),
+                       near_pos=near)
+            return
+
+        if closest:
+            gap_pennies, combo = closest
+            gap = gap_pennies / 100.0
+            parts = "  +  ".join(_fmt_num(v, currency)
+                                 for v in sorted(combo, key=lambda v: -abs(v)))
+            show_toast("No exact match",
+                       subtitle=(f"closest is {parts}  ·  "
+                                 f"out by {_fmt_num(gap, currency)}"),
+                       accent=AMBER, near_pos=near)
+            return
+
+        show_toast("No combination found",
+                   subtitle=f"nothing in these {pool} figures makes "
+                            f"{_fmt_num(target, currency)}",
+                   accent=AMBER, near_pos=near)
 
     def copy_as_table(self):
         """Copy the snip as tab-separated rows/columns — pastes into Excel."""
