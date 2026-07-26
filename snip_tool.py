@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import filedialog
 import threading
 import os
+import time
 import io
 import ctypes
 import ctypes.wintypes
@@ -224,9 +225,9 @@ def _open_overlay(sum_mode=False):
                         bbox=(real_x1, real_y1, real_x2, real_y2),
                         all_screens=True)
                     if sum_mode:
-                        # Snip-and-sum: show the total right beside the snip,
-                        # anchored to the top-right corner of the selection.
-                        near = (real_x2, real_y1)
+                        # Pass the whole selection rect so the toast can sit
+                        # beside it and never cover the figures.
+                        near = (real_x1, real_y1, real_x2, real_y2)
                         _sum_image_directly(img, near_pos=near)
                     else:
                         FloatingSnip(img, x=real_x1, y=real_y1)
@@ -251,12 +252,51 @@ def _open_overlay(sum_mode=False):
 # ══════════════════════════════════════════════════════════════════════════
 import re
 
+def _deprioritise_thread():
+    """
+    Drop the calling thread to below-normal priority.
+    OCR is CPU-heavy; without this it competes with the UI and the global
+    hotkey hook, which makes the whole tool feel sluggish.
+    """
+    try:
+        THREAD_PRIORITY_BELOW_NORMAL = -1
+        h = ctypes.windll.kernel32.GetCurrentThread()
+        ctypes.windll.kernel32.SetThreadPriority(
+            h, THREAD_PRIORITY_BELOW_NORMAL)
+    except Exception:
+        pass
+
+
+def _prepare_for_ocr(pil_image, max_edge=1600):
+    """
+    Cap the long edge before OCR. Beyond ~1600px the detector gains nothing
+    but costs real time, and RapidOCR rescales internally anyway.
+    Returns (image, scale_applied).
+    """
+    try:
+        w, h = pil_image.size
+        m = max(w, h)
+        if m <= max_edge:
+            return pil_image, 1.0
+        f = max_edge / float(m)
+        return pil_image.resize((max(1, int(w*f)), max(1, int(h*f))),
+                                Image.LANCZOS), f
+    except Exception:
+        return pil_image, 1.0
+
+
 # ── RapidOCR (neural OCR, runs fully offline) — PRIMARY ENGINE ────────────
 _rapid_engine = None
 _rapid_checked = False
 
 def _get_rapidocr():
-    """Return a RapidOCR engine if available, else None (cached)."""
+    """
+    Return a RapidOCR engine if available, else None (cached).
+
+    IMPORTANT: ONNX Runtime defaults to using every CPU core, which starves
+    the UI thread and the global-hotkey hook while OCR runs. We cap it at
+    half the cores (min 1, max 4) so the app stays responsive.
+    """
     global _rapid_engine, _rapid_checked
     if _rapid_checked:
         return _rapid_engine
@@ -266,7 +306,13 @@ def _get_rapidocr():
             from rapidocr_onnxruntime import RapidOCR
         except ImportError:
             from rapidocr import RapidOCR
-        _rapid_engine = RapidOCR()
+        cores = os.cpu_count() or 2
+        threads = max(1, min(4, cores // 2))
+        try:
+            _rapid_engine = RapidOCR(intra_op_num_threads=threads,
+                                     inter_op_num_threads=1)
+        except Exception:
+            _rapid_engine = RapidOCR()      # older build without kwargs
     except Exception:
         _rapid_engine = None
     return _rapid_engine
@@ -697,35 +743,34 @@ def _fmt_num(n, currency=""):
 def _count_text_rows(pil_img):
     """
     Count horizontal bands of text via a projection profile.
-    Lets us tell when OCR has silently missed a row.
+    Vectorised with numpy — the previous pixel-by-pixel Python loop was a
+    noticeable stall on large snips.
     """
     try:
         from PIL import ImageOps
+        import numpy as np
         g = pil_img.convert("L")
         w, h = g.size
         if h < 20 or w < 10:
             return 0
         g = ImageOps.autocontrast(g, cutoff=1)
-        px = g.load()
-        hist = g.histogram()
-        dark_bg = sum(hist[:128]) > sum(hist[128:])
-        step = max(1, w // 200)
-        samples = len(range(0, w, step))
-        thresh = max(1, int(0.02 * samples))
-        bands, in_band, start = 0, False, 0
-        for y in range(h):
-            ink = 0
-            for x in range(0, w, step):
-                v = px[x, y]
-                if (v > 170) if dark_bg else (v < 110):
-                    ink += 1
-            if ink >= thresh and not in_band:
-                in_band, start = True, y
-            elif ink < thresh and in_band:
-                in_band = False
-                if y - start >= max(5, h // 60):
+        a = np.asarray(g)
+        dark_bg = (a < 128).sum() > (a >= 128).sum()
+        ink = (a > 170) if dark_bg else (a < 110)
+        counts = ink.sum(axis=1)
+        thresh = max(1, int(0.02 * w))
+        on = counts >= thresh
+        # Count runs of True that are tall enough to be a text row
+        min_h = max(5, h // 60)
+        bands, run = 0, 0
+        for v in on:
+            if v:
+                run += 1
+            else:
+                if run >= min_h:
                     bands += 1
-        if in_band and h - start >= max(5, h // 60):
+                run = 0
+        if run >= min_h:
             bands += 1
         return bands
     except Exception:
@@ -818,7 +863,14 @@ def _ocr_image(pil_image):
     """
     from collections import Counter
 
-    expected_rows = _count_text_rows(pil_image)
+    _deprioritise_thread()
+
+    # Oversized snips are downscaled first — big speed win, no accuracy loss
+    pil_image, _scale = _prepare_for_ocr(pil_image)
+
+    # Row count only drives a sanity warning, so skip it on huge snips
+    _px = pil_image.size[0] * pil_image.size[1]
+    expected_rows = _count_text_rows(pil_image) if _px <= 1_800_000 else 0
 
     # ── PRIMARY: RapidOCR (neural, offline) ───────────────────────────────
     # Accurate enough that it needs no preprocessing; try it plain first,
@@ -1076,8 +1128,15 @@ def ask_amount(prompt="Difference to find", near_pos=None, prefill=""):
 
     entry.focus_force()
     entry.select_range(0, tk.END)
-    dlg.grab_set()
-    dlg.wait_window()
+    try:
+        dlg.grab_set()
+        dlg.wait_window()
+    finally:
+        # A leftover grab would swallow input everywhere else in the app
+        try:
+            dlg.grab_release()
+        except Exception:
+            pass
     return result["value"]
 
 
@@ -1086,7 +1145,7 @@ def ask_amount(prompt="Difference to find", near_pos=None, prefill=""):
 # ══════════════════════════════════════════════════════════════════════════
 _active_toasts = []
 
-def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=6000,
+def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=10000,
                currency="", near_pos=None):
     """Show a small notification that fades away.
     If near_pos=(x, y) is given, appear next to that screen point (the snip);
@@ -1149,19 +1208,43 @@ def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=6000,
         margin = 18
 
         if near_pos is not None:
-            # Appear just to the right of (and level with) the selection.
-            nx, ny = near_pos
-            x = nx + 12
-            y = ny
-            # Keep it fully on-screen
-            if x + tw + margin > sw:      # would overflow right → put on left
-                x = nx - tw - 12
-            if x < margin:
-                x = margin
-            if y + th + margin > sh:
-                y = sh - th - margin
-            if y < margin:
-                y = margin
+            # near_pos may be a point (x, y) or the snip rect (x1, y1, x2, y2).
+            # Never cover the snip: try right, left, below, then above it, and
+            # only take a slot that fits fully on screen.
+            if len(near_pos) == 4:
+                rx1, ry1, rx2, ry2 = near_pos
+            else:
+                rx1, ry1 = near_pos
+                rx2, ry2 = rx1, ry1
+
+            gap = 12
+            candidates = [
+                (rx2 + gap,        ry1),                 # right
+                (rx1 - tw - gap,   ry1),                 # left
+                (rx1,              ry2 + gap),           # below
+                (rx1,              ry1 - th - gap),      # above
+            ]
+
+            x = y = None
+            for cx, cy in candidates:
+                # Clamp along the free axis without pushing back over the snip
+                ty = min(max(margin, cy), sh - th - margin)
+                tx = min(max(margin, cx), sw - tw - margin)
+                fits_x = tx >= margin and tx + tw <= sw - margin
+                fits_y = ty >= margin and ty + th <= sh - margin
+                if not (fits_x and fits_y):
+                    continue
+                # Reject anything that would still overlap the snip
+                overlaps = not (tx + tw <= rx1 or tx >= rx2 or
+                                ty + th <= ry1 or ty >= ry2)
+                if overlaps:
+                    continue
+                x, y = tx, ty
+                break
+
+            if x is None:            # nowhere clear — fall back to a corner
+                x = sw - tw - margin
+                y = sh - th - margin - 48
         else:
             # Bottom-right, stacked above existing toasts
             taskbar = 48
@@ -1628,19 +1711,16 @@ class FloatingSnip:
         threading.Thread(target=worker, daemon=True).start()
 
     def _toast_anchor(self):
+        """Full rect of this snip window, so result toasts never cover it."""
         try:
-            return (self.win.winfo_x() + self.win.winfo_width(),
-                    self.win.winfo_y())
+            x, y = self.win.winfo_x(), self.win.winfo_y()
+            return (x, y, x + self.win.winfo_width(),
+                    y + self.win.winfo_height())
         except Exception:
             return None
 
     def sum_numbers(self):
-        # Anchor the result toast to the top-right of this snip window
-        try:
-            near = (self.win.winfo_x() + self.win.winfo_width(),
-                    self.win.winfo_y())
-        except Exception:
-            near = None
+        near = self._toast_anchor()
         def worker():
             result = _ocr_image(self.original_image)
             if result is None:
@@ -1691,14 +1771,42 @@ def reset_tally(icon=None, item=None):
 def close_all_snips():
     for w in list(snip_windows): w.close()
 
+_hotkeys_ok = False
+
 def _start_hotkey_listener():
-    try:
-        import keyboard
-        keyboard.add_hotkey("ctrl+shift+s", take_snip)   # snip -> floating window
-        keyboard.add_hotkey("ctrl+shift+x", sum_snip)    # snip -> sum instantly
-        keyboard.wait()
-    except ImportError:
-        pass
+    """
+    Register the global hotkeys. Previously this only caught ImportError, so
+    any other failure killed the thread silently and the shortcuts just
+    stopped working. Now it reports the problem and retries once.
+    """
+    global _hotkeys_ok
+    for attempt in (1, 2):
+        try:
+            import keyboard
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
+        try:
+            import keyboard
+            keyboard.add_hotkey("ctrl+shift+s", take_snip)
+            keyboard.add_hotkey("ctrl+shift+x", sum_snip)
+            _hotkeys_ok = True
+            keyboard.wait()          # blocks this thread while hooks are live
+            return
+        except ImportError:
+            return                   # package genuinely missing
+        except Exception as e:
+            _hotkeys_ok = False
+            if attempt == 2 and _tk_root is not None:
+                msg = str(e)[:60]
+                try:
+                    _tk_root.after(0, lambda: show_toast(
+                        "Shortcuts unavailable",
+                        subtitle=f"{msg} — use the tray icon",
+                        accent=AMBER))
+                except Exception:
+                    pass
+            time.sleep(1.5)
 
 def _run_tk():
     global _tk_root
