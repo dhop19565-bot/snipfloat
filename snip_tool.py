@@ -1,6 +1,6 @@
 """
 DarcySnipTool - System tray snipping tool for Windows
-Ctrl+Alt+S to snip, Ctrl+Shift+X to snip & sum, or use the tray icon.
+Ctrl+Shift+D to snip, Ctrl+Shift+X to snip & sum, or use the tray icon.
 """
 
 import tkinter as tk
@@ -31,11 +31,19 @@ _tk_ready     = threading.Event()
 _snip_active  = False
 
 # ── HOTKEYS ───────────────────────────────────────────────────────────────
-# Change these if they clash with something else on your machine.
-# Avoid "win+shift+s" (Windows Snipping Tool) and "ctrl+shift+s" (Save As
-# in many apps). Other safe options: "ctrl+alt+d", "alt+s", "ctrl+alt+1".
-HOTKEY_SNIP = "ctrl+alt+s"     # snip -> floating window
-HOTKEY_SUM  = "ctrl+shift+x"     # snip -> sum instantly
+# Change these if they clash, then check Tray -> "Shortcuts..." to confirm
+# they actually registered.
+#
+# AVOID:
+#   win+shift+s   - Windows Snipping Tool
+#   ctrl+shift+s  - "Save As" in many apps
+#   ctrl+alt+<k>  - on a UK keyboard Ctrl+Alt IS AltGr, so these are often
+#                   swallowed before the hook ever sees them
+#
+# KNOWN-GOOD ALTERNATIVES:
+#   "ctrl+shift+d"   "ctrl+shift+q"   "ctrl+shift+f9"   "shift+f2"
+HOTKEY_SNIP = "ctrl+shift+d"   # snip -> floating window
+HOTKEY_SUM  = "ctrl+shift+x"   # snip -> sum instantly
 
 ORANGE    = "#FF8C00"
 ORANGE_DK = "#CC6600"
@@ -1030,6 +1038,42 @@ def _present_sum(numbers, total, agreement, currency, near_pos=None, rows=0):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  MONITOR GEOMETRY  (multi-screen aware)
+# ══════════════════════════════════════════════════════════════════════════
+def _monitor_bounds_for(x, y):
+    """
+    Return (left, top, right, bottom) of the WORK AREA of the monitor
+    containing point (x, y) — i.e. excluding the taskbar.
+
+    tkinter's winfo_screenwidth() only ever reports the PRIMARY monitor, so
+    using it to place windows pulls them back onto screen 1. This asks
+    Windows directly instead.
+    """
+    try:
+        from ctypes import wintypes
+        MONITOR_DEFAULTTONEAREST = 2
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize",    ctypes.c_ulong),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork",    wintypes.RECT),
+                        ("dwFlags",   ctypes.c_ulong)]
+
+        pt = wintypes.POINT(int(x), int(y))
+        hmon = ctypes.windll.user32.MonitorFromPoint(
+            pt, MONITOR_DEFAULTTONEAREST)
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            r = mi.rcWork
+            if r.right > r.left and r.bottom > r.top:
+                return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  SMALL THEMED INPUT DIALOG
 # ══════════════════════════════════════════════════════════════════════════
 def ask_amount(prompt="Difference to find", near_pos=None, prefill=""):
@@ -1090,14 +1134,28 @@ def ask_amount(prompt="Difference to find", near_pos=None, prefill=""):
 
     dlg.update_idletasks()
     w, h = dlg.winfo_width(), dlg.winfo_height()
-    sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+
+    # Place on the monitor the snip is on, not the primary screen
+    sx0, sy0 = 0, 0
+    sx1, sy1 = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
     if near_pos:
-        x, y = near_pos[0] + 12, near_pos[1]
-        if x + w + 20 > sw: x = near_pos[0] - w - 12
-        if y + h + 20 > sh: y = sh - h - 20
-        x, y = max(10, x), max(10, y)
+        cx = (near_pos[0] + near_pos[2]) / 2 if len(near_pos) == 4 else near_pos[0]
+        cy = (near_pos[1] + near_pos[3]) / 2 if len(near_pos) == 4 else near_pos[1]
+        mon = _monitor_bounds_for(cx, cy)
+        if mon:
+            sx0, sy0, sx1, sy1 = mon
+
+    if near_pos:
+        rx2 = near_pos[2] if len(near_pos) == 4 else near_pos[0]
+        ry1 = near_pos[1]
+        x, y = rx2 + 12, ry1
+        if x + w + 20 > sx1:
+            x = (near_pos[0] if len(near_pos) == 4 else near_pos[0]) - w - 12
+        x = min(max(sx0 + 10, x), sx1 - w - 10)
+        y = min(max(sy0 + 10, y), sy1 - h - 10)
     else:
-        x, y = (sw - w) // 2, (sh - h) // 3
+        x = sx0 + (sx1 - sx0 - w) // 2
+        y = sy0 + (sy1 - sy0 - h) // 3
     dlg.geometry(f"+{int(x)}+{int(y)}")
 
     entry.focus_force()
@@ -1177,9 +1235,21 @@ def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=10000,
         toast.update_idletasks()
         tw = toast.winfo_width()
         th = toast.winfo_height()
-        sw = toast.winfo_screenwidth()
-        sh = toast.winfo_screenheight()
         margin = 18
+
+        # Bounds to keep the toast inside. Default to the primary screen,
+        # but if we know where the snip is, use ITS monitor instead —
+        # winfo_screenwidth() only knows about the primary display, which
+        # is what previously dragged the toast back onto screen 1.
+        sx0, sy0 = 0, 0
+        sx1 = toast.winfo_screenwidth()
+        sy1 = toast.winfo_screenheight()
+        if near_pos is not None:
+            _cx = (near_pos[0] + near_pos[2]) / 2 if len(near_pos) == 4 else near_pos[0]
+            _cy = (near_pos[1] + near_pos[3]) / 2 if len(near_pos) == 4 else near_pos[1]
+            mon = _monitor_bounds_for(_cx, _cy)
+            if mon:
+                sx0, sy0, sx1, sy1 = mon
 
         if near_pos is not None:
             # near_pos may be a point (x, y) or the snip rect (x1, y1, x2, y2).
@@ -1201,11 +1271,11 @@ def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=10000,
 
             x = y = None
             for cx, cy in candidates:
-                # Clamp along the free axis without pushing back over the snip
-                ty = min(max(margin, cy), sh - th - margin)
-                tx = min(max(margin, cx), sw - tw - margin)
-                fits_x = tx >= margin and tx + tw <= sw - margin
-                fits_y = ty >= margin and ty + th <= sh - margin
+                # Clamp within the SNIP'S monitor, not the primary screen
+                ty = min(max(sy0 + margin, cy), sy1 - th - margin)
+                tx = min(max(sx0 + margin, cx), sx1 - tw - margin)
+                fits_x = tx >= sx0 + margin and tx + tw <= sx1 - margin
+                fits_y = ty >= sy0 + margin and ty + th <= sy1 - margin
                 if not (fits_x and fits_y):
                     continue
                 # Reject anything that would still overlap the snip
@@ -1216,16 +1286,15 @@ def show_toast(title, subtitle="", accent=BLUE, numbers=None, duration=10000,
                 x, y = tx, ty
                 break
 
-            if x is None:            # nowhere clear — fall back to a corner
-                x = sw - tw - margin
-                y = sh - th - margin - 48
+            if x is None:            # nowhere clear — corner of THAT monitor
+                x = sx1 - tw - margin
+                y = sy1 - th - margin
         else:
             # Bottom-right, stacked above existing toasts
-            taskbar = 48
-            offset  = sum(t.winfo_height() + 10 for t in _active_toasts
-                          if t.winfo_exists())
-            x = sw - tw - margin
-            y = sh - th - taskbar - margin - offset
+            offset = sum(t.winfo_height() + 10 for t in _active_toasts
+                         if t.winfo_exists())
+            x = sx1 - tw - margin
+            y = sy1 - th - margin - offset
 
         toast.geometry(f"+{int(x)}+{int(y)}")
 
@@ -1746,54 +1815,125 @@ def close_all_snips():
     for w in list(snip_windows): w.close()
 
 _hotkeys_ok = False
+_hotkey_state = {}
+
+
+def _parse_combo(combo):
+    """'ctrl+shift+d' -> (modifier_flags, virtual_key_code)."""
+    MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x0001, 0x0002, 0x0004, 0x0008
+    mods, vk = 0, None
+    for p in combo.lower().split("+"):
+        p = p.strip()
+        if p in ("ctrl", "control"):
+            mods |= MOD_CONTROL
+        elif p == "shift":
+            mods |= MOD_SHIFT
+        elif p == "alt":
+            mods |= MOD_ALT
+        elif p in ("win", "super", "cmd"):
+            mods |= MOD_WIN
+        elif len(p) == 1:
+            vk = ord(p.upper())
+        elif p.startswith("f") and p[1:].isdigit():
+            n = int(p[1:])
+            if 1 <= n <= 24:
+                vk = 0x70 + n - 1          # VK_F1 .. VK_F24
+        elif p in ("space",):
+            vk = 0x20
+        elif p in ("insert", "ins"):
+            vk = 0x2D
+        elif p in ("printscreen", "prtsc"):
+            vk = 0x2C
+    return mods, vk
+
+
+def _win32_hotkey_loop():
+    """
+    Register global hotkeys with Windows' RegisterHotKey API.
+
+    Why not the `keyboard` package? It installs a LOW-LEVEL KEYBOARD HOOK,
+    and Windows silently removes such hooks if they fail to respond within
+    LowLevelHooksTimeout. Heavy OCR load is exactly the sort of thing that
+    trips that — which is why shortcuts would work, then die mid-session.
+    RegisterHotKey posts WM_HOTKEY messages instead, so it can't be dropped,
+    and it fails loudly at registration if a combo is already taken.
+    Returns True if at least one hotkey registered.
+    """
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        WM_HOTKEY   = 0x0312
+        MOD_NOREPEAT = 0x4000
+
+        handlers = {}
+        hk_id = 0
+        for combo, fn in ((HOTKEY_SNIP, take_snip), (HOTKEY_SUM, sum_snip)):
+            mods, vk = _parse_combo(combo)
+            if vk is None:
+                _hotkey_state[combo] = "failed: unrecognised key"
+                continue
+            hk_id += 1
+            if user32.RegisterHotKey(None, hk_id, mods | MOD_NOREPEAT, vk):
+                handlers[hk_id] = fn
+                _hotkey_state[combo] = "registered"
+            else:
+                _hotkey_state[combo] = "failed: already in use"
+
+        if not handlers:
+            return False
+
+        msg = wintypes.MSG()
+        while True:
+            r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if r in (0, -1):
+                break
+            if msg.message == WM_HOTKEY:
+                fn = handlers.get(msg.wParam)
+                if fn:
+                    try:
+                        fn()               # returns immediately; work is queued
+                    except Exception:
+                        pass               # never let a handler kill the loop
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        return True
+    except Exception as ex:
+        _hotkey_state["_error"] = "RegisterHotKey: " + str(ex)[:40]
+        return False
+
 
 def _start_hotkey_listener():
     """
-    Register the global hotkeys. Previously this only caught ImportError, so
-    any other failure killed the thread silently and the shortcuts just
-    stopped working. Now it reports the problem and retries once.
+    Prefer Windows' RegisterHotKey (robust, can't be silently unhooked).
+    Fall back to the `keyboard` package only if that fails entirely.
     """
     global _hotkeys_ok
-    for attempt in (1, 2):
-        try:
-            import keyboard
-            keyboard.unhook_all_hotkeys()
-        except Exception:
-            pass
-        try:
-            import keyboard
-            failed = []
-            for combo, fn in ((HOTKEY_SNIP, take_snip), (HOTKEY_SUM, sum_snip)):
-                try:
-                    keyboard.add_hotkey(combo, fn)
-                except Exception:
-                    failed.append(combo)      # one clash mustn't kill the other
-            _hotkeys_ok = len(failed) < 2
-            if failed and _tk_root is not None:
-                names = ", ".join(c.replace("+", "+").upper() for c in failed)
-                try:
-                    _tk_root.after(0, lambda: show_toast(
-                        "Shortcut in use",
-                        subtitle=f"{names} is taken by another app",
-                        accent=AMBER))
-                except Exception:
-                    pass
-            keyboard.wait()          # blocks this thread while hooks are live
-            return
-        except ImportError:
-            return                   # package genuinely missing
-        except Exception as e:
-            _hotkeys_ok = False
-            if attempt == 2 and _tk_root is not None:
-                msg = str(e)[:60]
-                try:
-                    _tk_root.after(0, lambda: show_toast(
-                        "Shortcuts unavailable",
-                        subtitle=f"{msg} — use the tray icon",
-                        accent=AMBER))
-                except Exception:
-                    pass
-            time.sleep(1.5)
+
+    if _win32_hotkey_loop():
+        _hotkeys_ok = True
+        return                              # loop only exits on shutdown
+
+    # ── Fallback: the keyboard package ───────────────────────────────────
+    try:
+        import keyboard
+    except ImportError:
+        _hotkey_state["_error"] = "no hotkey mechanism available"
+        return
+    try:
+        for combo, fn in ((HOTKEY_SNIP, take_snip), (HOTKEY_SUM, sum_snip)):
+            if _hotkey_state.get(combo) == "registered":
+                continue
+            try:
+                keyboard.add_hotkey(combo, fn)
+                _hotkey_state[combo] = "registered (fallback hook)"
+            except Exception as ex:
+                _hotkey_state[combo] = "failed: " + str(ex)[:40]
+        _hotkeys_ok = any(v.startswith("registered")
+                          for v in _hotkey_state.values())
+        keyboard.wait()
+    except Exception as ex:
+        _hotkey_state["_error"] = str(ex)[:50]
+
 
 def _run_tk():
     global _tk_root
@@ -1811,6 +1951,33 @@ def _pretty_key(combo):
     """'ctrl+alt+s' -> 'Ctrl+Alt+S' for menu labels."""
     return "+".join(p.capitalize() if len(p) > 1 else p.upper()
                     for p in combo.split("+"))
+
+
+def show_shortcut_status(icon=None, item=None):
+    """Report whether each global shortcut actually registered."""
+    if _hotkey_state.get("_error"):
+        _tk_root.after(0, lambda: show_toast(
+            "Shortcuts unavailable",
+            subtitle=_hotkey_state["_error"] + " — use the tray icon",
+            accent=AMBER))
+        return
+
+    lines, all_ok, fallback = [], True, False
+    for combo, label in ((HOTKEY_SNIP, "Snip"), (HOTKEY_SUM, "Snip & Sum")):
+        state = _hotkey_state.get(combo, "not registered")
+        ok = state.startswith("registered")
+        if "fallback" in state:
+            fallback = True
+        all_ok = all_ok and ok
+        lines.append(f"{'✓' if ok else '✗'} {label}: {_pretty_key(combo)}")
+
+    sub = "   ".join(lines)
+    if fallback:
+        sub += "   (hook mode — may drop under load)"
+    _tk_root.after(0, lambda: show_toast(
+        "Shortcuts" if all_ok else "Shortcut problem",
+        subtitle=sub,
+        accent=(GREEN if all_ok and not fallback else AMBER)))
 
 
 def show_engine_status(icon=None, item=None):
@@ -1842,6 +2009,7 @@ def build_tray():
              toggle_tally, checked=lambda i: _tally_enabled),
         item("♻  Reset tally", reset_tally),
         pystray.Menu.SEPARATOR,
+        item("⌨  Shortcuts…", show_shortcut_status),
         item("🔧  OCR engine…", show_engine_status),
         pystray.Menu.SEPARATOR,
         item("🗑  Close All Snips",
